@@ -50,6 +50,7 @@ REQ = [
     "pandas",  # Required by ray.train
     "tensorboard",  # Required by ray.train
     "tensorboardX",  # Sometimes needed by ray.train
+    "transformers",
     "einops>=0.6.0",
     "asteroid>=0.5.0",
     "asteroid-filterbanks>=0.4.0",

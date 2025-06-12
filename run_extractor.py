@@ -60,12 +60,14 @@ proc_group.add_argument("--disable-speechbrain", action="store_true", help="Disa
 proc_group.add_argument("--skip-rejected-transcripts", action="store_true", help="Skip transcription of segments that were rejected by speaker verification.")
 proc_group.add_argument("--concat-silence", type=float, default=0.25, help="Duration of silence (seconds) between concatenated SOLO verified segments.")
 proc_group.add_argument("--preload-whisper", action="store_true", help="Pre-load Whisper model at startup (can save time if RAM is sufficient).")
+proc_group.add_argument("--classify-and-clean", action="store_true", help="After verification, classify segments as clean/noisy and run Bandit-v2 on only the noisy ones.")
 
 # Fine-tuning Parameters for SOLO Segments
 tune_group = parser.add_argument_group('Fine-tuning Parameters for SOLO Segments')
 tune_group.add_argument("--min-duration", type=float, default=1.0, help="Minimum duration (seconds) for a refined SOLO voice segment to be kept.")
 tune_group.add_argument("--merge-gap", type=float, default=0.25, help="Maximum gap (seconds) between target speaker's SOLO segments to merge them.")
 tune_group.add_argument("--verification-threshold", type=float, default=0.7, help="Minimum combined speaker verification score (0.0-1.0) for a SOLO segment.")
+tune_group.add_argument("--noise-threshold", type=float, default=0.7, help="Cleanliness threshold (0-1) for NoisySpeechDetection model when using --classify-and-clean.")
 
 # Debugging and Miscellaneous
 debug_group = parser.add_argument_group('Debugging and Miscellaneous')
@@ -123,6 +125,8 @@ try:
         init_speechbrain_speaker_recognition_model,
         slice_and_verify_target_solo_segments,
         transcribe_segments,
+        classify_segments_for_noise,
+        run_bandit_on_noisy_segments,
         concatenate_segments,
         HAVE_BANDIT_V2, HAVE_WESPEAKER, HAVE_SPEECHBRAIN
     )
@@ -132,7 +136,6 @@ except ImportError as e_pipeline_import:
               "or issues with PYTHONPATH for Bandit-v2 if its repo path was not provided or is incorrect.")
     if args.bandit_repo_path: log.error(f"  Bandit-v2 repo path used: {args.bandit_repo_path}")
     sys.exit(1)
-
 
 def main(args):
     """Main orchestrator function for the voice extraction pipeline."""
@@ -156,8 +159,8 @@ def main(args):
         log.error("[bold red]Target name cannot be empty. Exiting.[/]"); sys.exit(1)
 
     # Check if critical toolkits are available based on imports and args
-    if not args.skip_bandit and not HAVE_BANDIT_V2:
-        log.error("[bold red]Bandit-v2 selected but library not loaded. Check installation and --bandit-repo-path. Exiting.[/]"); sys.exit(1)
+    if (not args.skip_bandit or args.classify_and_clean) and not HAVE_BANDIT_V2:
+        log.error("[bold red]Bandit-v2 is required for this workflow but its library/repository was not found. Check installation and --bandit-repo-path. Exiting.[/]"); sys.exit(1)
     if not HAVE_WESPEAKER:
         log.error("[bold red]WeSpeaker library not loaded. This is critical for speaker ID/Verification. Check installation. Exiting.[/]"); sys.exit(1)
 
@@ -183,17 +186,17 @@ def main(args):
     log.info(f"Reference audio for '{target_name_str}': [bold cyan]{reference_audio_p.name}[/]")
     log.info(f"Run output directory: [bold cyan]{output_dir.resolve()}[/]")
     if args.dry_run: log.warning("[DRY-RUN MODE ENABLED] Processing will be limited.")
-    
+
+    log.info(f"[bold cyan]===== Voice Extractor Initializing (Device: {DEVICE.type.upper()}) =====[/]")
     # --- STAGE 0: Initialize Models ---
     log.info("[bold magenta]== STAGE 0: Initializing Models ==[/]")
     bandit_separator_model = None
-    if not args.skip_bandit:
+    if not args.skip_bandit or args.classify_and_clean:
         if not args.bandit_model_path:
-            log.error("[bold red]--bandit-model-path is required if not skipping Bandit-v2. Exiting.[/]"); sys.exit(1)
+            log.error("[bold red]--bandit-model-path is required for this workflow. Exiting.[/]"); sys.exit(1)
         bandit_separator_model = init_bandit_separator(Path(args.bandit_model_path))
         if bandit_separator_model is None: 
-            log.error("[bold red]Failed to initialize Bandit-v2 model. Exiting as it's selected.[/]"); sys.exit(1)
-    
+            log.error("[bold red]Failed to initialize Bandit-v2 model, which is required for this workflow. Exiting.[/]"); sys.exit(1)
     if not args.wespeaker_rvector_model or not args.wespeaker_gemini_model:
         log.error("[bold red]--wespeaker-rvector-model and --wespeaker-gemini-model are required. Exiting.[/]"); sys.exit(1)
     wespeaker_models = init_wespeaker_models(args.wespeaker_rvector_model, args.wespeaker_gemini_model)
@@ -233,8 +236,8 @@ def main(args):
     # --- STAGE 2: Vocal Separation (Bandit-v2) ---
     source_for_diarization_osd = input_audio_p
     bandit_vocals_file = None
-    if not args.skip_bandit and bandit_separator_model:
-        log.info("[bold magenta]== STAGE 2: Vocal Separation (Bandit-v2) ==[/]")
+    if not args.skip_bandit and not args.classify_and_clean and bandit_separator_model:
+        log.info("[bold magenta]== STAGE 2: Initial Vocal Separation (Bandit-v2) ==[/]")
         bandit_vocals_file = run_bandit_vocal_separation(input_audio_p, bandit_separator_model, separated_vocals_dir)
         if bandit_vocals_file and bandit_vocals_file.exists():
             save_detailed_spectrograms(bandit_vocals_file, visualizations_output_dir, "02a_BanditV2_Vocals_Only", target_name_str)
@@ -243,8 +246,10 @@ def main(args):
         else:
             log.warning("Bandit-v2 vocal separation failed or produced no output. Using original audio for downstream tasks.")
     else:
-        log.info(f"Skipping Bandit-v2. Using original input '{input_audio_p.name}' for diarization and OSD.")
-
+        if args.classify_and_clean:
+            log.info("[bold yellow]Skipping initial Bandit-v2 run because --classify-and-clean is active. Bandit will be used later on noisy segments.[/]")
+        else:
+            log.info(f"Skipping Bandit-v2. Using original input '{input_audio_p.name}' for diarization and OSD.")
     # --- STAGE 3: Speaker Diarization (PyAnnote 3.1) ---
     log.info("[bold magenta]== STAGE 3: Speaker Diarization ==[/]")
     diar_model_config = {"diar_model": args.diar_model, "diar_hyperparams": {}}
@@ -301,7 +306,46 @@ def main(args):
         wespeaker_models, speechbrain_model,
         output_sample_rate=int(args.output_sr), output_channels=1
     )
+    
+    # --- NEW STAGE 6.5: Classify, Separate, and Re-process Noisy Segments ---
+    if args.classify_and_clean and verified_solo_paths:
+        log.info(f"[bold magenta]== STAGE 6.5: Classifying and Cleaning Noisy Segments ==[/]")
+        
+        # 1. Classify segments
+        initially_clean_paths, noisy_paths_to_clean = classify_segments_for_noise(
+            verified_solo_paths, args.noise_threshold
+        )
+        
+        # 2. Re-organize files into new subdirectories for clarity
+        clean_verified_dir = segments_base_output_dir / "clean_verified"
+        noisy_originals_dir = segments_base_output_dir / "noisy_originals_for_cleaning"
+        cleaned_by_bandit_dir = segments_base_output_dir / "noisy_cleaned_by_bandit"
+        ensure_dir_exists(clean_verified_dir)
+        ensure_dir_exists(noisy_originals_dir)
+        ensure_dir_exists(cleaned_by_bandit_dir)
 
+        # Move files and update path lists
+        final_clean_paths = []
+        for p in initially_clean_paths:
+            dest = clean_verified_dir / p.name
+            shutil.move(str(p), str(dest))
+            final_clean_paths.append(dest)
+        
+        moved_noisy_paths = []
+        for p in noisy_paths_to_clean:
+            dest = noisy_originals_dir / p.name
+            shutil.move(str(p), str(dest))
+            moved_noisy_paths.append(dest)
+        
+        # 3. Run Bandit on the noisy segments
+        newly_cleaned_paths = run_bandit_on_noisy_segments(
+            moved_noisy_paths, bandit_separator_model, cleaned_by_bandit_dir, run_tmp_dir
+        )
+
+        # 4. Update the final list of verified paths for downstream tasks
+        verified_solo_paths = final_clean_paths + newly_cleaned_paths
+        log.info(f"Final dataset for transcription/concatenation consists of {len(final_clean_paths)} initially clean + {len(newly_cleaned_paths)} newly cleaned segments.")
+    
     # --- STAGE 7: Transcribe Segments (Whisper) ---
     if verified_solo_paths:
         log.info(f"[bold magenta]== STAGE 7a: Transcribing VERIFIED SOLO Segments ('{target_name_str}') ==[/]")
