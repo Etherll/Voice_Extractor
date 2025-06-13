@@ -479,14 +479,14 @@ def ff_trim(src_path: Path, dst_path: Path, start_time: float, end_time: float, 
         log.error(f"ffmpeg trim failed for {dst_path.name}: {err_msg}")
         raise
 
-def ff_slice(src_path: Path, dst_path: Path, start_time: float, end_time: float, target_sr: int, target_ac: int = 1):
+def ff_slice(src_path: Path, dst_path: Path, start_time: float, end_time: float, target_ac: int = 1):
     if ffmpeg is None or log is None:
         print("ERROR: ffmpeg or log not initialized in ff_slice.")
         raise RuntimeError("ffmpeg or log not initialized")
     try:
         (
             ffmpeg.input(str(src_path), ss=start_time, to=end_time)
-            .output(str(dst_path), acodec="pcm_s16le", ar=target_sr, ac=target_ac)
+            .output(str(dst_path), acodec="pcm_s16le", ac=target_ac)
             .overwrite_output()
             .run(quiet=True, capture_stdout=True, capture_stderr=True)
         )

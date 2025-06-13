@@ -1540,7 +1540,6 @@ def identify_target_speaker(
                         temp_seg_path,
                         seg.start,
                         seg.end,
-                        target_sr=16000,
                         target_ac=1,
                     )
                     if temp_seg_path.exists() and temp_seg_path.stat().st_size > 0:
@@ -2034,7 +2033,6 @@ def slice_classify_clean_and_verify_target_solo_segments(
                 temp_segment_for_classification_path,
                 segment_start_time,
                 segment_end_time,
-                target_sr=16000,
                 target_ac=1
             )
 
@@ -2053,7 +2051,6 @@ def slice_classify_clean_and_verify_target_solo_segments(
                     segment_audio_path_for_verification,
                     segment_start_time,
                     segment_end_time,
-                    target_sr=16000,
                     target_ac=1,
                 )
                 segment_classification = "unknown (slicing_failed)"
@@ -2081,7 +2078,6 @@ def slice_classify_clean_and_verify_target_solo_segments(
                         original_noisy_segment_for_bandit_path,
                         segment_start_time,
                         segment_end_time,
-                        target_sr=16000,
                     )
 
                     if (
@@ -2168,7 +2164,6 @@ def slice_classify_clean_and_verify_target_solo_segments(
                 segment_audio_path_for_verification,
                 segment_start_time,
                 segment_end_time,
-                target_sr=16000,
                 target_ac=1
             )
             segment_classification = "N/A (standard_flow)"
