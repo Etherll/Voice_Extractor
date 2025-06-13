@@ -21,6 +21,7 @@ import hashlib
 from tqdm import tqdm
 import time
 import re
+import random
 
 # Pattern to identify Netflix-internal packages
 NETFLIX_PRIVATE_PACKAGES = re.compile(
@@ -1294,6 +1295,376 @@ def ensure_repositories(component_usage=None):
     else:
         logger_func("[Setup] Skipping Bandit-v2 setup (not needed)")
 
+
+def detect_silence_boundaries(audio_file: Path, start_time: float, end_time: float, 
+                             min_silence_duration: float = 0.1, 
+                             silence_threshold: float = -40) -> list[float]:
+    """
+    Detect silence boundaries in an audio segment for intelligent cutting.
+    
+    Args:
+        audio_file: Path to the audio file
+        start_time: Start time of the segment to analyze
+        end_time: End time of the segment to analyze
+        min_silence_duration: Minimum duration of silence to consider as a boundary (in seconds)
+        silence_threshold: Threshold in dB below which audio is considered silence
+    
+    Returns:
+        List of time positions (relative to start_time) where silence occurs
+    """
+    if librosa is None or numpy is None:
+        print("ERROR: librosa or numpy not imported yet in detect_silence_boundaries.")
+        return []
+    
+    try:
+        # Load only the segment we need to analyze
+        segment_duration = end_time - start_time
+        y, sr = librosa.load(audio_file, sr=16000, offset=start_time, duration=segment_duration)
+        
+        if len(y) == 0:
+            return []
+        
+        # Calculate RMS energy
+        frame_length = int(0.025 * sr)  # 25ms frames
+        hop_length = int(0.010 * sr)    # 10ms hop
+        
+        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+          # Convert to dB
+        rms_db = librosa.amplitude_to_db(rms, ref=numpy.max(rms))
+        
+        # Find frames below silence threshold
+        silent_frames = rms_db < silence_threshold
+        
+        # Convert frame indices to time
+        times = librosa.frames_to_time(numpy.arange(len(rms_db)), sr=sr, hop_length=hop_length)
+        
+        # Find continuous silent regions
+        silence_boundaries = []
+        in_silence = False
+        silence_start = 0
+        
+        for i, (time_pos, is_silent) in enumerate(zip(times, silent_frames)):
+            if is_silent and not in_silence:
+                # Start of silence
+                in_silence = True
+                silence_start = time_pos
+            elif not is_silent and in_silence:
+                # End of silence
+                in_silence = False
+                silence_duration = time_pos - silence_start
+                if silence_duration >= min_silence_duration:
+                    # Use middle of silence region as boundary
+                    boundary_time = silence_start + silence_duration / 2
+                    silence_boundaries.append(boundary_time)
+        
+        # Handle case where segment ends in silence
+        if in_silence:
+            silence_duration = times[-1] - silence_start
+            if silence_duration >= min_silence_duration:
+                boundary_time = silence_start + silence_duration / 2
+                silence_boundaries.append(boundary_time)
+        
+        return silence_boundaries
+        
+    except Exception as e:
+        if log:
+            log.warning(f"Could not detect silence boundaries in audio segment: {e}")
+        return []
+
+
+def calculate_intelligent_chunks(total_duration: float, silence_boundaries: list[float],
+                                min_chunk_duration: float = 3.0, 
+                                max_chunk_duration: float = 30.0) -> list[tuple[float, float]]:
+    """
+    Calculate intelligent chunk boundaries with varied lengths.
+    
+    Args:
+        total_duration: Total duration of the segment to chunk
+        silence_boundaries: List of silence boundary positions 
+        min_chunk_duration: Minimum chunk duration
+        max_chunk_duration: Maximum chunk duration
+    
+    Returns:
+        List of (start_time, end_time) tuples for each chunk
+    """
+    if total_duration <= max_chunk_duration:
+        return [(0.0, total_duration)]
+    
+    chunks = []
+    current_start = 0.0
+    
+    # Add boundaries at start and end
+    all_boundaries = [0.0] + silence_boundaries + [total_duration]
+    all_boundaries = sorted(set(all_boundaries))  # Remove duplicates and sort
+    
+    while current_start < total_duration:
+        remaining_duration = total_duration - current_start
+        
+        if remaining_duration <= max_chunk_duration:
+            # Last chunk
+            chunks.append((current_start, total_duration))
+            break
+        
+        # Find potential end points within our preferred range
+        target_min_end = current_start + min_chunk_duration
+        target_max_end = current_start + max_chunk_duration
+        
+        # Find boundaries in our target range
+        valid_boundaries = [b for b in all_boundaries 
+                          if target_min_end <= b <= target_max_end]
+        
+        if valid_boundaries:
+            # Choose a boundary, preferring those that create varied chunk sizes
+            # Add some randomness to avoid uniform chunks
+            if len(valid_boundaries) > 1:
+                # Weight boundaries based on distance from edges of range
+                weights = []
+                for boundary in valid_boundaries:
+                    # Prefer boundaries not too close to min or max
+                    distance_from_min = boundary - target_min_end
+                    distance_from_max = target_max_end - boundary
+                    weight = min(distance_from_min, distance_from_max) + random.uniform(0.5, 1.5)
+                    weights.append(weight)
+                
+                # Select weighted random boundary
+                total_weight = sum(weights)
+                r = random.uniform(0, total_weight)
+                cumulative_weight = 0
+                chosen_boundary = valid_boundaries[-1]
+                
+                for boundary, weight in zip(valid_boundaries, weights):
+                    cumulative_weight += weight
+                    if r <= cumulative_weight:
+                        chosen_boundary = boundary
+                        break
+                
+                chunk_end = chosen_boundary
+            else:
+                chunk_end = valid_boundaries[0]
+        else:
+            # No suitable boundary found, find closest boundary or use max duration
+            future_boundaries = [b for b in all_boundaries if b > target_min_end]
+            
+            if future_boundaries:
+                next_boundary = min(future_boundaries)
+                if next_boundary - current_start <= max_chunk_duration * 1.2:  # Allow slight overage
+                    chunk_end = next_boundary
+                else:
+                    chunk_end = current_start + max_chunk_duration
+            else:
+                chunk_end = current_start + max_chunk_duration
+        
+        chunks.append((current_start, chunk_end))
+        current_start = chunk_end
+    
+    return chunks
+
+
+def ff_slice_intelligent(src_path: Path, dst_dir: Path, segment_start_time: float, 
+                        segment_end_time: float, base_name: str, target_sr: int = 16000, 
+                        target_ac: int = 1, max_segment_duration: float = 30.0,
+                        min_chunk_duration: float = 3.0) -> list[Path]:
+    """
+    Intelligently slice a long audio segment into smaller, meaningful chunks.
+    
+    Args:
+        src_path: Source audio file
+        dst_dir: Destination directory for chunks
+        segment_start_time: Start time of the segment in the source file
+        segment_end_time: End time of the segment in the source file
+        base_name: Base name for output files
+        target_sr: Target sample rate
+        target_ac: Target audio channels
+        max_segment_duration: Maximum duration for a single chunk
+        min_chunk_duration: Minimum duration for a single chunk
+    
+    Returns:
+        List of paths to created chunk files
+    """
+    if ffmpeg is None or log is None:
+        print("ERROR: ffmpeg or log not initialized in ff_slice_intelligent.")
+        raise RuntimeError("ffmpeg or log not initialized")
+    
+    segment_duration = segment_end_time - segment_start_time
+    
+    # If segment is not too long, use regular slicing
+    if segment_duration <= max_segment_duration:
+        dst_path = dst_dir / f"{base_name}.wav"
+        ff_slice(src_path, dst_path, segment_start_time, segment_end_time, target_ac)
+        return [dst_path]
+    
+    # Ensure destination directory exists
+    ensure_dir_exists(dst_dir)
+    
+    log.info(f"Segment duration {segment_duration:.1f}s exceeds {max_segment_duration}s. "
+             f"Intelligently splitting into smaller chunks...")
+    
+    # Detect silence boundaries for intelligent cutting
+    silence_boundaries = detect_silence_boundaries(
+        src_path, segment_start_time, segment_end_time,
+        min_silence_duration=0.1, silence_threshold=-40
+    )
+    
+    log.info(f"Found {len(silence_boundaries)} potential cut points based on silence detection.")
+    
+    # Calculate intelligent chunk boundaries
+    chunk_boundaries = calculate_intelligent_chunks(
+        segment_duration, silence_boundaries, min_chunk_duration, max_segment_duration
+    )
+    
+    log.info(f"Split into {len(chunk_boundaries)} chunks with varied durations:")
+    for i, (start, end) in enumerate(chunk_boundaries):
+        duration = end - start
+        log.info(f"  Chunk {i+1}: {duration:.1f}s")
+    
+    # Create the chunks
+    created_files = []
+    
+    for i, (chunk_start, chunk_end) in enumerate(chunk_boundaries):
+        # Calculate absolute times in the source file
+        abs_start = segment_start_time + chunk_start
+        abs_end = segment_start_time + chunk_end
+        
+        # Create filename for this chunk
+        chunk_filename = f"{base_name}_chunk{i+1:02d}_{chunk_start:.1f}s_{chunk_end:.1f}s.wav"
+        chunk_path = dst_dir / chunk_filename
+        
+        try:
+            # Slice the chunk
+            ff_slice(src_path, chunk_path, abs_start, abs_end, target_ac)
+            
+            if chunk_path.exists() and chunk_path.stat().st_size > 0:
+                created_files.append(chunk_path)
+                log.info(f"Created chunk: {chunk_filename}")
+            else:
+                log.warning(f"Failed to create chunk: {chunk_filename}")
+                
+        except Exception as e:
+            log.error(f"Error creating chunk {chunk_filename}: {e}")
+            continue
+    
+    if not created_files:
+        log.warning("No chunks were successfully created. Falling back to regular slicing.")
+        dst_path = dst_dir / f"{base_name}_fallback.wav"
+        ff_slice(src_path, dst_path, segment_start_time, segment_end_time, target_ac)
+        return [dst_path]
+    
+    log.info(f"Successfully created {len(created_files)} intelligent chunks.")
+    return created_files
+
+def ff_slice_smart(src_path: Path, dst_path: Path, start_time: float, end_time: float, 
+                   target_sr: int = 16000, target_ac: int = 1, 
+                   max_segment_duration: float = 30.0, min_chunk_duration: float = 3.0) -> Path:
+    """
+    Smart slice function that provides backward compatibility with ff_slice while adding intelligent chunking.
+    
+    For segments <= max_segment_duration: Creates a single file at dst_path (like original ff_slice)
+    For segments > max_segment_duration: Creates intelligent chunks and concatenates them to dst_path
+    
+    Args:
+        src_path: Source audio file
+        dst_path: Destination file path (single output file)
+        start_time: Start time of the segment
+        end_time: End time of the segment
+        target_sr: Target sample rate
+        target_ac: Target audio channels
+        max_segment_duration: Threshold for using intelligent chunking
+        min_chunk_duration: Minimum chunk duration for intelligent chunking
+    
+    Returns:
+        Path to the created file (dst_path)
+    """
+    if ffmpeg is None or log is None:
+        print("ERROR: ffmpeg or log not initialized in ff_slice_smart.")
+        raise RuntimeError("ffmpeg or log not initialized")
+    
+    segment_duration = end_time - start_time
+    
+    if segment_duration <= max_segment_duration:
+        # Use regular ff_slice for short segments
+        ff_slice(src_path, dst_path, start_time, end_time, target_ac)
+        return dst_path
+    
+    # Use intelligent chunking for long segments
+    log.info(f"Segment duration {segment_duration:.1f}s > {max_segment_duration}s. Using intelligent chunking.")
+    
+    # Create temporary directory for chunks
+    temp_chunks_dir = dst_path.parent / f"temp_chunks_{dst_path.stem}"
+    ensure_dir_exists(temp_chunks_dir)
+    
+    try:
+        # Create intelligent chunks
+        base_name = dst_path.stem
+        chunk_files = ff_slice_intelligent(
+            src_path=src_path,
+            dst_dir=temp_chunks_dir,
+            segment_start_time=start_time,
+            segment_end_time=end_time,
+            base_name=base_name,
+            target_sr=target_sr,
+            target_ac=target_ac,
+            max_segment_duration=max_segment_duration,
+            min_chunk_duration=min_chunk_duration
+        )
+        
+        if not chunk_files:
+            log.warning("No chunks created by intelligent chunking. Falling back to regular ff_slice.")
+            ff_slice(src_path, dst_path, start_time, end_time, target_ac)
+            return dst_path
+        
+        if len(chunk_files) == 1:
+            # Only one chunk, just move it to the final destination
+            chunk_files[0].rename(dst_path)
+            log.info(f"Single chunk created, moved to {dst_path.name}")
+        else:
+            # Multiple chunks, concatenate them
+            log.info(f"Concatenating {len(chunk_files)} chunks to create final segment.")
+            
+            # Create concatenation list file
+            concat_list_file = temp_chunks_dir / "concat_list.txt"
+            concat_lines = []
+            
+            for chunk_file in chunk_files:
+                if chunk_file.exists() and chunk_file.stat().st_size > 0:
+                    concat_lines.append(f"file '{chunk_file.resolve().as_posix()}'")
+            
+            if not concat_lines:
+                raise RuntimeError("No valid chunks found for concatenation")
+            
+            concat_list_file.write_text("\n".join(concat_lines), encoding="utf-8")
+            
+            # Use ffmpeg to concatenate chunks
+            try:
+                (
+                    ffmpeg.input(str(concat_list_file), format="concat", safe=0)
+                    .output(
+                        str(dst_path),
+                        acodec="pcm_s16le",
+                        ar=target_sr,
+                        ac=target_ac,
+                    )
+                    .overwrite_output()
+                    .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                )
+                log.info(f"Successfully concatenated chunks to {dst_path.name}")
+            except ffmpeg.Error as e:
+                err_msg = e.stderr.decode('utf8', errors='ignore') if e.stderr else 'ffmpeg concatenation error'
+                log.error(f"ffmpeg concatenation failed: {err_msg}")
+                # Fallback to regular slicing
+                log.info("Falling back to regular ff_slice due to concatenation error.")
+                ff_slice(src_path, dst_path, start_time, end_time, target_ac)
+        
+        return dst_path
+        
+    finally:
+        # Clean up temporary chunks directory
+        if temp_chunks_dir.exists():
+            import shutil
+            try:
+                shutil.rmtree(temp_chunks_dir)
+                log.debug(f"Cleaned up temporary chunks directory: {temp_chunks_dir}")
+            except Exception as e:
+                log.warning(f"Could not clean up temporary directory {temp_chunks_dir}: {e}")
 
 if __name__ == '__main__':
     # For testing

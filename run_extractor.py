@@ -159,7 +159,7 @@ proc_group.add_argument(
 proc_group.add_argument(
     "--preload-whisper",
     action="store_true",
-    help="Pre-load Whisper model at startup (can save time if RAM is sufficient).",
+    help="[DEPRECATED] Whisper model is now always loaded once at startup for optimal performance.",
 )
 proc_group.add_argument(
     "--classify-and-clean",
@@ -431,23 +431,24 @@ def main(args):
                     "Failed to initialize SpeechBrain model. ECAPA-TDNN verification will be skipped."
                 )
     else:
-        log.info("SpeechBrain ECAPA-TDNN verification is disabled by user.")
-
-    whisper_asr_model = None
+        log.info("SpeechBrain ECAPA-TDNN verification is disabled by user.")    # --- Load Whisper Model Once for All Transcription Tasks ---
     if args.preload_whisper:
-        try:
-            log.info(
-                f"Pre-loading Whisper model '{args.whisper_model}' to {DEVICE.type.upper()}..."
-            )
-            import whisper
+        log.info("[yellow]Note: --preload-whisper flag is deprecated. Whisper is now always loaded once at startup for optimal performance.[/]")
+    
+    whisper_asr_model = None
+    try:
+        log.info(
+            f"Loading Whisper model '{args.whisper_model}' to {DEVICE.type.upper()} (optimization: load once, use many times)..."
+        )
+        import whisper
 
-            whisper_asr_model = whisper.load_model(args.whisper_model, device=DEVICE)
-            log.info(f"Whisper model '{args.whisper_model}' pre-loaded.")
-        except Exception as e_preload_whisper:
-            log.error(
-                f"Failed to pre-load Whisper model: {e_preload_whisper}. Will attempt to load during transcription stage."
-            )
-            whisper_asr_model = None
+        whisper_asr_model = whisper.load_model(args.whisper_model, device=DEVICE)
+        log.info(f"Whisper model '{args.whisper_model}' loaded successfully.")
+    except Exception as e_load_whisper:
+        log.error(
+            f"Failed to load Whisper model '{args.whisper_model}': {e_load_whisper}. Will attempt to load during transcription stage."
+        )
+        whisper_asr_model = None
 
     # --- STAGE 1: Prepare Reference Audio ---
     log.info("[bold magenta]== STAGE 1: Reference Audio Preparation ==[/]")
@@ -614,6 +615,8 @@ def main(args):
         bandit_vocals_file=bandit_vocals_file,
         noise_classification_confidence_threshold=args.noise_threshold,
         skip_verification_if_cleaned=False,
+        whisper_model_instance=whisper_asr_model,
+        language=args.language,
     )
     
     # Extract rejected segment paths from segment details

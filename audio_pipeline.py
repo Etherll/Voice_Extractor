@@ -75,7 +75,7 @@ from common import (
     console,
     DEVICE,
     ff_trim,
-    ff_slice,
+    ff_slice_smart,
     cos,
     DEFAULT_MIN_SEGMENT_SEC,
     DEFAULT_MAX_MERGE_GAP,
@@ -218,14 +218,12 @@ def init_bandit_separator(model_checkpoint_path: Path) -> dict | None:
                     logger.warning(f"Could not load any Hydra config: {e2}")
                     # Use direct model loading without build_system
                     logger.info("Using direct model loading approach...")
-                    
-                    # Import model directly
+                      # Import model directly
                     from src.models.bandit.bandit import Bandit
-                    
-                    # Create model with standard parameters matching the checkpoint
+                      # Create model with standard parameters matching the checkpoint
                     model = Bandit(
-                        in_channels=1,  # Changed from 2 to 1 to match checkpoint
-                        stems=['speech'],
+                        in_channels=1,  # Mono input
+                        stems=['speech', 'music', 'sfx'],  # Must match the checkpoint training stems
                         fs=48000,
                         band_type='musical',
                         n_bands=64,
@@ -246,8 +244,7 @@ def init_bandit_separator(model_checkpoint_path: Path) -> dict | None:
                         hop_length=512,
                         window_fn='hann_window'
                     )
-                    
-                    # Load the checkpoint directly into the model
+                      # Load the checkpoint directly into the model
                     logger.info(f"Loading checkpoint weights from: {model_checkpoint_path}")
                     
                     # Use the pre-resolved absolute path for loading
@@ -263,11 +260,22 @@ def init_bandit_separator(model_checkpoint_path: Path) -> dict | None:
                                 model_state_dict[key[6:]] = value
                             else:
                                 model_state_dict[key] = value
-                        model.load_state_dict(model_state_dict, strict=False)
+                        
+                        # Try strict loading first to see what's mismatched
+                        try:
+                            model.load_state_dict(model_state_dict, strict=True)
+                            logger.info("✓ Checkpoint loaded with strict=True")
+                        except Exception as strict_error:
+                            logger.warning(f"Strict loading failed: {strict_error}")
+                            logger.info("Trying with strict=False...")
+                            missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
+                            if missing_keys:
+                                logger.warning(f"Missing keys: {missing_keys[:5]}...")  # Show first 5
+                            if unexpected_keys:
+                                logger.warning(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
                     else:
                         model.load_state_dict(checkpoint, strict=False)
-                    
-                    # Move to device and set to eval mode
+                      # Move to device and set to eval mode
                     model.to(device)
                     model.eval()
                     
@@ -277,7 +285,8 @@ def init_bandit_separator(model_checkpoint_path: Path) -> dict | None:
                         "system": model,  # For compatibility, store model as system
                         "config": None,   # No config needed for direct loading
                         "repo_path": bandit_repo_path,
-                        "direct_model": True  # Flag to indicate this is direct loading
+                        "direct_model": True,  # Flag to indicate this is direct loading
+                        "checkpoint_path": absolute_checkpoint_path  # Store original path for fallback
                     }
             
             # Override checkpoint path regardless of how we got the config
@@ -625,10 +634,33 @@ def run_bandit_vocal_separation(
     
     # Check if we have a loaded model (new way) or checkpoint path (old way)
     if isinstance(bandit_separator, dict) and "system" in bandit_separator:
-        # Use the new direct method with loaded model
-        return run_bandit_vocal_separation_direct(
-            input_audio_file, bandit_separator, output_dir, chunk_minutes
-        )
+        # Try the new direct method with loaded model first
+        try:
+            result = run_bandit_vocal_separation_direct(
+                input_audio_file, bandit_separator, output_dir, chunk_minutes
+            )
+            if result is not None:
+                return result
+            else:
+                log.warning("Direct Bandit method returned None, falling back to subprocess method")
+        except Exception as e:
+            log.warning(f"Direct Bandit method failed: {e}, falling back to subprocess method")
+        
+        # If direct method failed, fall back to subprocess method
+        # Extract the original checkpoint path for subprocess method
+        if "repo_path" in bandit_separator:
+            checkpoint_path = bandit_separator.get("checkpoint_path")
+            if checkpoint_path is None:
+                # Try to find the checkpoint in the expected location
+                checkpoint_path = Path("models/bandit_checkpoint_eng.ckpt")
+            
+            return run_bandit_vocal_separation_subprocess(
+                input_audio_file, checkpoint_path, output_dir, chunk_minutes
+            )
+        else:
+            log.error("Failed to find checkpoint path for subprocess fallback")
+            return None
+            
     elif isinstance(bandit_separator, Path):
         # Use the old subprocess method
         return run_bandit_vocal_separation_subprocess(
@@ -802,9 +834,9 @@ def _process_single_file(
         "--config-name",
         "inference_temp",
         f"ckpt_path={checkpoint_path.resolve()}",
-        f"+test_audio={input_file.resolve()}",
-        f"--output_path={output_dir.resolve()}",
-        "--model_variant=speech",
+        f"test_audio={input_file.resolve()}",
+        f"output_path={output_dir.resolve()}",
+        "model_variant=speech",
     ]
 
     env = os.environ.copy()
@@ -917,9 +949,10 @@ def _process_in_chunks(
                 "--config-name",
                 "inference_temp",
                 f"ckpt_path={checkpoint_path.resolve()}",
-                f"+test_audio={chunk_input.resolve()}",                f"--output_path={chunk_output_dir.resolve()}",
-                "--model_variant=speech",
-                "--inference.kwargs.inference_batch_size=1",  # FIX: Override batch size to 1
+                f"test_audio={chunk_input.resolve()}",
+                f"output_path={chunk_output_dir.resolve()}",
+                "model_variant=speech",
+                "inference.kwargs.inference_batch_size=1",  # FIX: Override batch size to 1
             ]
 
             env = os.environ.copy()
@@ -1529,17 +1562,16 @@ def identify_target_speaker(
 
             for i, seg in enumerate(speaker_segments_timeline):
                 if current_duration_for_embedding >= MAX_EMBED_DURATION_PER_SPEAKER:
-                    break
-
-                # Slice segment from input_audio_file and resample to 16kHz for WeSpeaker
+                    break                # Slice segment from input_audio_file and resample to 16kHz for WeSpeaker
                 temp_seg_path = temp_seg_dir / f"{safe_filename(spk_label)}_seg_{i}.wav"
                 try:
-                    # ff_slice will take care of format (wav) and resampling (16kHz mono)
-                    ff_slice(
+                    # ff_slice_smart will handle intelligent chunking if needed
+                    ff_slice_smart(
                         input_audio_file,
                         temp_seg_path,
                         seg.start,
                         seg.end,
+                        target_sr=16000,
                         target_ac=1,
                     )
                     if temp_seg_path.exists() and temp_seg_path.stat().st_size > 0:
@@ -1937,12 +1969,18 @@ def slice_classify_clean_and_verify_target_solo_segments(
     bandit_model_checkpoint: Path | None,
     bandit_vocals_file: Path | None,
     noise_classification_confidence_threshold: float = 0.3,
-    skip_verification_if_cleaned: bool = False,
+    skip_verification_if_cleaned: bool = False,    whisper_model_instance = None,
+    language: str = "en",
 ) -> tuple[list[Path], list[dict]]:
     """
     Slices segments for the target speaker, optionally classifies/cleans them,
     verifies them, and optionally transcribes them.
     Manages VRAM by loading/unloading noise classifier when classify_and_clean is active.
+    
+    Args:
+        ...existing args...
+        whisper_model_instance: Pre-loaded Whisper model instance for efficient transcription
+        language: Language code for transcription
     """
     log.info(
         f"Processing segments for target speaker: '{target_name}' (Label: {target_speaker_label})"
@@ -2028,11 +2066,12 @@ def slice_classify_clean_and_verify_target_solo_segments(
             temp_segment_for_classification_path = (
                 tmp_dir_segments / f"{segment_base_name}_for_classify_16k_mono.wav"
             )            
-            ff_slice(
+            ff_slice_smart(
                 original_audio_file,
                 temp_segment_for_classification_path,
                 segment_start_time,
                 segment_end_time,
+                target_sr=16000,
                 target_ac=1
             )
 
@@ -2044,13 +2083,13 @@ def slice_classify_clean_and_verify_target_solo_segments(
                     f"Failed to create segment for classification: {temp_segment_for_classification_path.name}. Skipping."
                 )
                 segment_audio_path_for_verification = (
-                    tmp_dir_segments / f"{segment_base_name}_original_16k_mono.wav"
-                )
-                ff_slice(
+                    tmp_dir_segments / f"{segment_base_name}_original_16k_mono.wav"                )
+                ff_slice_smart(
                     original_audio_file,
                     segment_audio_path_for_verification,
                     segment_start_time,
                     segment_end_time,
+                    target_sr=16000,
                     target_ac=1,
                 )
                 segment_classification = "unknown (slicing_failed)"
@@ -2071,13 +2110,14 @@ def slice_classify_clean_and_verify_target_solo_segments(
 
                     original_noisy_segment_for_bandit_path = (
                         tmp_dir_segments
-                        / f"{segment_base_name}_original_for_bandit.wav"
-                    )
-                    ff_slice(
+                        / f"{segment_base_name}_original_for_bandit.wav"                    )
+                    ff_slice_smart(
                         original_audio_file,
                         original_noisy_segment_for_bandit_path,
                         segment_start_time,
                         segment_end_time,
+                        target_sr=16000,
+                        target_ac=1,
                     )
 
                     if (
@@ -2157,13 +2197,13 @@ def slice_classify_clean_and_verify_target_solo_segments(
 
         else:  # Not classify_and_clean, or no classifier instance
             segment_audio_path_for_verification = (
-                tmp_dir_segments / f"{segment_base_name}_std_16k_mono.wav"
-            )
-            ff_slice(
+                tmp_dir_segments / f"{segment_base_name}_std_16k_mono.wav"            )
+            ff_slice_smart(
                 audio_source_for_slicing,
                 segment_audio_path_for_verification,
                 segment_start_time,
                 segment_end_time,
+                target_sr=16000,
                 target_ac=1
             )
             segment_classification = "N/A (standard_flow)"
@@ -2311,6 +2351,8 @@ def slice_classify_clean_and_verify_target_solo_segments(
                             final_verified_segment_path,
                             whisper_model_name,
                             tmp_dir_segments,
+                            whisper_model_instance=whisper_model_instance,
+                            language=language
                         )
                         segment_details["transcript"] = transcript_text
                         log.info(
@@ -2358,10 +2400,18 @@ def slice_classify_clean_and_verify_target_solo_segments(
     return verified_segment_audio_files, all_segment_details
 
 
-def transcribe_audio(audio_path: Path, model_name: str, tmp_dir: Path) -> str | None:
+def transcribe_audio(audio_path: Path, model_name: str, tmp_dir: Path, 
+                    whisper_model_instance=None, language: str = "en") -> str | None:
     """
     Transcribes a given audio file using Whisper ASR model.
     Saves the transcript to a text file and returns the transcript.
+    
+    Args:
+        audio_path: Path to audio file to transcribe
+        model_name: Name of Whisper model (used only if whisper_model_instance is None)
+        tmp_dir: Directory to save transcript file
+        whisper_model_instance: Pre-loaded Whisper model instance (preferred for performance)
+        language: Language for transcription
     """
     if not audio_path.exists() or audio_path.stat().st_size == 0:
         log.warning(
@@ -2378,21 +2428,29 @@ def transcribe_audio(audio_path: Path, model_name: str, tmp_dir: Path) -> str | 
     # Ensure temporary directory for transcription files
     ensure_dir_exists(tmp_dir)
 
-    # Whisper model loading and transcription
-    try:
-        # Load the Whisper model (large-v2 or other variants)
-        model = whisper.load_model(model_name, device=DEVICE)
-        log.info(f"Whisper model '{model_name}' loaded.")
-    except Exception as e:
-        log.error(f"Failed to load Whisper model '{model_name}': {e}")
-        return None
+    # Use pre-loaded model if available, otherwise load it
+    model = whisper_model_instance
+    if model is None:
+        try:
+            log.info(f"Loading Whisper model '{model_name}'...")
+            model = whisper.load_model(model_name, device=DEVICE)
+            log.info(f"Whisper model '{model_name}' loaded.")
+        except Exception as e:
+            log.error(f"Failed to load Whisper model '{model_name}': {e}")
+            return None
+    else:
+        log.debug(f"Using pre-loaded Whisper model for {audio_path.name}")
 
     # Transcription result
     transcript_text = ""
 
     # Perform transcription
     try:
-        result = model.transcribe(str(audio_path), fp16=DEVICE.type == "cuda")
+        transcribe_kwargs = {"fp16": DEVICE.type == "cuda"}
+        if language and language != "auto":
+            transcribe_kwargs["language"] = language
+        
+        result = model.transcribe(str(audio_path), **transcribe_kwargs)
         transcript_text = result["text"].strip() if "text" in result else ""
         log.info(f"Transcription successful for {audio_path.name}.")
     except Exception as e_transcribe:
@@ -2423,6 +2481,15 @@ def transcribe_segments(
     """
     Transcribes multiple audio segments using the Whisper ASR model.
     Returns a dictionary mapping segment paths to their transcripts.
+    
+    Args:
+        segment_paths: List of audio file paths to transcribe
+        output_dir: Directory to save transcript files
+        target_name: Name of target speaker
+        segment_label: Label for this batch of segments
+        whisper_model_name: Name of Whisper model (used only if whisper_model_instance is None)
+        language: Language for transcription
+        whisper_model_instance: Pre-loaded Whisper model instance (preferred for performance)
     """
     ensure_dir_exists(output_dir)
     
@@ -2431,17 +2498,34 @@ def transcribe_segments(
         log.warning(f"No {segment_label} segments to transcribe.")
         return {}
 
+    # Load model once if not provided
+    model_to_use = whisper_model_instance
+    if model_to_use is None and segment_paths:
+        try:
+            log.info(f"Loading Whisper model '{whisper_model_name}' for batch transcription...")
+            import whisper
+            model_to_use = whisper.load_model(whisper_model_name, device=DEVICE)
+            log.info(f"Whisper model '{whisper_model_name}' loaded for batch processing.")
+        except Exception as e:
+            log.error(f"Failed to load Whisper model '{whisper_model_name}': {e}")
+            return {}
+    elif model_to_use is not None:
+        log.info(f"Using pre-loaded Whisper model for batch transcription of {len(segment_paths)} segments.")
+
     transcripts = {}
-    for segment_path in segment_paths:
+    for i, segment_path in enumerate(segment_paths, 1):
         if not segment_path.exists() or segment_path.stat().st_size == 0:
             log.warning(f"Segment file missing or empty: {segment_path.name}")
             continue
 
         try:
+            log.debug(f"Transcribing segment {i}/{len(segment_paths)}: {segment_path.name}")
             transcript = transcribe_audio(
                 segment_path,
                 whisper_model_name,
                 output_dir,
+                whisper_model_instance=model_to_use,
+                language=language
             )
             if transcript:
                 transcripts[segment_path] = transcript
@@ -2983,48 +3067,105 @@ def _process_audio_single_direct(
             audio = audio.unsqueeze(0)  # Add channel dimension
         
         audio = audio.to(DEVICE)
-          # Create batch
-        batch = {
-            "mixture": {
-                "audio": audio.unsqueeze(0),  # Add batch dimension
-            }
-        }
-
+        
         logger.info("Running inference with Bandit-v2 model...")
         
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
-            console=console,
-        ) as progress:
+            console=console,        ) as progress:
             task = progress.add_task("Bandit-v2 (direct)...", total=None)
             
             with torch.inference_mode():
                 # Check if this is a direct model (without system wrapper) or a system
                 if hasattr(system, 'inference_handler') and hasattr(system, 'model'):
                     # This is a system with inference handler
+                    batch = {
+                        "mixture": {
+                            "audio": audio.unsqueeze(0),  # Add batch dimension
+                        }
+                    }
                     output = system.inference_handler(batch["mixture"]["audio"], system.model)
                 else:
                     # This is a direct model, call forward method directly
-                    output = system(batch)
-            
+                    # For direct model, need to pass the correct batch format
+                    audio_input = audio.unsqueeze(0)  # Shape: [batch=1, channels, time]
+                    logger.info(f"Input shape to direct model: {audio_input.shape}")
+                    
+                    # Bandit model expects batch format: {"mixture": {"audio": tensor}}
+                    batch_input = {
+                        "mixture": {
+                            "audio": audio_input
+                        }
+                    }
+                    
+                    try:
+                        output = system(batch_input)
+                        logger.info(f"Direct model output type: {type(output)}")
+                        if isinstance(output, torch.Tensor):
+                            logger.info(f"Direct model output shape: {output.shape}")
+                        elif isinstance(output, dict):
+                            logger.info(f"Direct model output keys: {list(output.keys())}")
+                            for key, val in output.items():
+                                if isinstance(val, torch.Tensor):
+                                    logger.info(f"  {key}: {val.shape}")
+                                elif isinstance(val, dict):
+                                    logger.info(f"  {key}: dict with keys {list(val.keys())}")
+                        elif isinstance(output, (list, tuple)):
+                            logger.info(f"Direct model output list/tuple length: {len(output)}")
+                            for i, item in enumerate(output):
+                                if isinstance(item, torch.Tensor):
+                                    logger.info(f"  [{i}]: {item.shape}")
+                        else:
+                            logger.info(f"Direct model output: {output}")
+                    except Exception as model_error:
+                        logger.error(f"Error during model forward pass: {model_error}")
+                        import traceback
+                        logger.error(f"Model error traceback: {traceback.format_exc()}")
+                        raise
             progress.update(task, completed=1, total=1)
 
         # Extract vocals from output
-        if "estimates" in output and "speech" in output["estimates"]:
+        logger.info(f"DEBUG: Output type: {type(output)}")
+        if isinstance(output, torch.Tensor):
+            logger.info(f"DEBUG: Output tensor shape: {output.shape}")
+        
+        if isinstance(output, dict) and "estimates" in output and "speech" in output["estimates"]:
+            # System output format
             vocals_audio = output["estimates"]["speech"]["audio"][0].cpu()
-              # Save the vocals
-            ta.save(str(output_path), vocals_audio, sample_rate)
+        elif isinstance(output, torch.Tensor):
+            # Direct model output - debug the actual shape
+            logger.info(f"Direct model output shape: {output.shape}")
             
-            if output_path.exists() and output_path.stat().st_size > 0:
-                logger.info(f"[green]✓ Bandit-v2 direct separation completed: {output_path.name}[/]")
-                return output_path
+            if output.dim() == 4:  # [batch, stems, channels, time]
+                vocals_audio = output[0, 0].cpu()  # First batch, first stem (speech)
+            elif output.dim() == 3:  # Could be [stems, channels, time] or [batch, channels, time]
+                # Check if this looks like [stems, channels, time] (multiple stems)
+                if output.shape[0] == 3:  # 3 stems: speech, music, sfx
+                    vocals_audio = output[0].cpu()  # First stem (speech)
+                else:
+                    # Assume [batch, channels, time] - single stem output
+                    vocals_audio = output[0].cpu()  # First batch
+            elif output.dim() == 2:  # [channels, time] - single audio
+                vocals_audio = output.cpu()
             else:
-                logger.error("Output file was not created or is empty")
+                logger.error(f"Unexpected output tensor shape: {output.shape}")
                 return None
         else:
-            logger.error("Expected 'speech' stem not found in Bandit output")
+            logger.error(f"Unexpected output format: {type(output)}")
+            if isinstance(output, dict):
+                logger.error(f"Output keys: {list(output.keys())}")
+            return None
+
+        # Save the vocals
+        ta.save(str(output_path), vocals_audio, sample_rate)
+        
+        if output_path.exists() and output_path.stat().st_size > 0:
+            logger.info(f"[green]✓ Bandit-v2 direct separation completed: {output_path.name}[/]")
+            return output_path
+        else:
+            logger.error("Output file was not created or is empty")
             return None
             
     except Exception as e:
