@@ -159,7 +159,7 @@ proc_group.add_argument(
 proc_group.add_argument(
     "--preload-whisper",
     action="store_true",
-    help="[DEPRECATED] Whisper model is now always loaded once at startup for optimal performance.",
+    help="Pre-load Whisper model at startup (can save time if RAM is sufficient).",
 )
 proc_group.add_argument(
     "--classify-and-clean",
@@ -193,6 +193,12 @@ tune_group.add_argument(
     default=0.7,
     help="Cleanliness threshold (0-1) for NoisySpeechDetection model when using --classify-and-clean.",
 )
+tune_group.add_argument(
+    "--max-segment-duration",
+    type=float,
+    default=30.0,
+    help="Maximum segment duration (seconds) before intelligent chunking is used. Set to a large value (e.g., 99999) to disable chunking entirely.",
+)
 
 # Debugging and Miscellaneous
 debug_group = parser.add_argument_group("Debugging and Miscellaneous")
@@ -211,6 +217,35 @@ debug_group.add_argument(
     "--keep-temp-files",
     action="store_true",
     help="Keep temporary processing directory (__tmp_processing).",
+)
+
+# Dataset Creation
+dataset_group = parser.add_argument_group("Dataset Creation")
+dataset_group.add_argument(
+    "--skip-dataset-creation",
+    action="store_true",
+    help="Skip creating a Hugging Face dataset from verified segments and transcripts (Stage 10).",
+)
+dataset_group.add_argument(
+    "--dataset-output-dir",
+    type=str,
+    help="Directory to save the created dataset (default: same as output directory).",
+)
+dataset_group.add_argument(
+    "--dataset-name",
+    type=str,
+    help="Name for the created dataset (auto-generated if not provided).",
+)
+dataset_group.add_argument(
+    "--dataset-sampling-rate",
+    type=int,
+    default=16000,
+    help="Target sampling rate for audio in the dataset.",
+)
+dataset_group.add_argument(
+    "--dataset-copy",
+    action="store_true",
+    help="Copy audio files to dataset directory (default: use original paths).",
 )
 
 args = parser.parse_args()
@@ -267,11 +302,18 @@ from common import (
     create_diarization_plot,
     ensure_dir_exists,
     safe_filename,
-    format_duration,
-    set_args_for_debug,
+    format_duration,    set_args_for_debug,
     torchaudio_version,
     torchvision_version,
 )
+
+# Import dataset creation functions
+try:
+    from create_dataset import create_dataset_from_run_output
+    HAVE_DATASET_CREATION = True
+except ImportError:
+    HAVE_DATASET_CREATION = False
+    create_dataset_from_run_output = None
 
 # Import pipeline functions AFTER setup
 try:    
@@ -283,9 +325,7 @@ try:
         detect_overlapped_regions,
         init_wespeaker_models,
         identify_target_speaker,
-        init_speechbrain_speaker_recognition_model,
-        slice_classify_clean_and_verify_target_solo_segments,
-        transcribe_audio,
+        init_speechbrain_speaker_recognition_model,        slice_classify_clean_and_verify_target_solo_segments,
         transcribe_segments,
         concatenate_segments,
         HAVE_BANDIT_V2,
@@ -431,24 +471,23 @@ def main(args):
                     "Failed to initialize SpeechBrain model. ECAPA-TDNN verification will be skipped."
                 )
     else:
-        log.info("SpeechBrain ECAPA-TDNN verification is disabled by user.")    # --- Load Whisper Model Once for All Transcription Tasks ---
-    if args.preload_whisper:
-        log.info("[yellow]Note: --preload-whisper flag is deprecated. Whisper is now always loaded once at startup for optimal performance.[/]")
-    
-    whisper_asr_model = None
-    try:
-        log.info(
-            f"Loading Whisper model '{args.whisper_model}' to {DEVICE.type.upper()} (optimization: load once, use many times)..."
-        )
-        import whisper
+        log.info("SpeechBrain ECAPA-TDNN verification is disabled by user.")
 
-        whisper_asr_model = whisper.load_model(args.whisper_model, device=DEVICE)
-        log.info(f"Whisper model '{args.whisper_model}' loaded successfully.")
-    except Exception as e_load_whisper:
-        log.error(
-            f"Failed to load Whisper model '{args.whisper_model}': {e_load_whisper}. Will attempt to load during transcription stage."
-        )
-        whisper_asr_model = None
+    whisper_asr_model = None
+    if args.preload_whisper:
+        try:
+            log.info(
+                f"Pre-loading Whisper model '{args.whisper_model}' to {DEVICE.type.upper()}..."
+            )
+            import whisper
+
+            whisper_asr_model = whisper.load_model(args.whisper_model, device=DEVICE)
+            log.info(f"Whisper model '{args.whisper_model}' pre-loaded.")
+        except Exception as e_preload_whisper:
+            log.error(
+                f"Failed to pre-load Whisper model: {e_preload_whisper}. Will attempt to load during transcription stage."
+            )
+            whisper_asr_model = None
 
     # --- STAGE 1: Prepare Reference Audio ---
     log.info("[bold magenta]== STAGE 1: Reference Audio Preparation ==[/]")
@@ -606,9 +645,8 @@ def main(args):
         target_name=target_name_str,
         min_segment_duration=args.min_duration,
         max_merge_gap=args.merge_gap,
-        verification_threshold=args.verification_threshold,
-        vad_verification=True,
-        transcribe_verified_segments=True,
+        verification_threshold=args.verification_threshold,        vad_verification=True,
+        transcribe_verified_segments=False,  # Transcription now happens in Stage 7 only
         classify_and_clean=args.classify_and_clean,
         noise_classifier_model_id="Etherll/NoisySpeechDetection-v0.2",
         bandit_model_checkpoint=bandit_separator_model if not args.skip_bandit else None,
@@ -617,6 +655,7 @@ def main(args):
         skip_verification_if_cleaned=False,
         whisper_model_instance=whisper_asr_model,
         language=args.language,
+        max_segment_duration=args.max_segment_duration,
     )
     
     # Extract rejected segment paths from segment details
@@ -714,9 +753,7 @@ def main(args):
         target_name_str,
         main_prefix="06_Audio_Processing_Stages_Overview",
         overlap_timeline_dict=overlap_timeline_for_plots,
-    )
-
-    # --- Finalization ---
+    )    # --- Finalization ---
     if not args.keep_temp_files and run_tmp_dir.exists():
         log.info(f"Cleaning up temporary directory: {run_tmp_dir.resolve()}")
         try:
@@ -727,8 +764,49 @@ def main(args):
             )
     else:
         log.info(f"Temporary processing files kept at: {run_tmp_dir.resolve()}")
-
+    
     total_duration_seconds = time.time() - start_time_total
+    
+    # --- STAGE 10: Dataset Creation ---
+    if not args.skip_dataset_creation:
+        if not HAVE_DATASET_CREATION:
+            log.warning("Dataset creation skipped: 'datasets' library not available. Install with: pip install datasets")
+        else:
+            log.info("[bold magenta]== STAGE 10: Creating Hugging Face Dataset ==[/]")
+            
+            # Determine dataset output directory
+            dataset_output_dir = Path(args.dataset_output_dir) if args.dataset_output_dir else output_dir
+            dataset_output_dir = dataset_output_dir / "dataset"
+              # Determine dataset name
+            dataset_name = args.dataset_name if args.dataset_name else f"voice_extractor_dataset_{safe_filename(target_name_str)}"
+            
+            try:
+                success = create_dataset_from_run_output(
+                    run_output_dir=output_dir,
+                    dataset_output_dir=dataset_output_dir,
+                    dataset_name=dataset_name,
+                    copy_audio_files=args.dataset_copy,
+                )
+                
+                if success:
+                    log.info(f"[bold green]✅ Dataset created successfully in Stage 10![/]")
+                    log.info(f"Dataset location: {dataset_output_dir / dataset_name}")
+                    
+                    # Add dataset info to final summary
+                    final_dataset_path = dataset_output_dir / dataset_name
+                    if final_dataset_path.exists():
+                        log.info(f"  - Dataset ready for ML training!")
+                        log.info(f"  - Load with: datasets.load_from_disk('{final_dataset_path}')")
+                else:
+                    log.error("Dataset creation failed in Stage 10!")
+                    
+            except Exception as e:
+                log.error(f"Error during dataset creation in Stage 10: {e}")
+                if args.debug:
+                    log.exception("Traceback for dataset creation error:")
+    else:
+        log.info("[bold magenta]== STAGE 10: Dataset Creation (SKIPPED) ==[/]")
+    
     log.info(
         f"[bold green]✅ Voice Extractor processing finished successfully for '{target_name_str}'![/]"
     )
@@ -753,6 +831,16 @@ def main(args):
         log.info(f"  - Whisper Transcripts (SOLO Rejected): {transcripts_rejected_dir}")
     log.info(f"  - Concatenated Audio (SOLO Verified): {concatenated_output_dir}")
     log.info(f"  - Visualizations: {visualizations_output_dir}")
+    
+    # Add dataset info if created
+    if not args.skip_dataset_creation and HAVE_DATASET_CREATION:
+        dataset_output_dir = Path(args.dataset_output_dir) if args.dataset_output_dir else output_dir
+        dataset_output_dir = dataset_output_dir / "dataset"
+        dataset_name = args.dataset_name if args.dataset_name else f"voice_extractor_dataset_{safe_filename(target_name_str)}"
+        final_dataset_path = dataset_output_dir / dataset_name
+        if final_dataset_path.exists():
+            log.info(f"  - [bold green]Hugging Face Dataset: {final_dataset_path}[/]")
+            log.info(f"    🎯 Ready for ML training! Load with: datasets.load_from_disk('{final_dataset_path}')")
 
 
 # --- CLI Entry Point ---

@@ -1554,25 +1554,27 @@ def ff_slice_intelligent(src_path: Path, dst_dir: Path, segment_start_time: floa
 
 def ff_slice_smart(src_path: Path, dst_path: Path, start_time: float, end_time: float, 
                    target_sr: int = 16000, target_ac: int = 1, 
-                   max_segment_duration: float = 30.0, min_chunk_duration: float = 3.0) -> Path:
+                   max_segment_duration: float = 30.0, min_chunk_duration: float = 3.0,
+                   return_chunks: bool = False) -> Path | list[Path]:
     """
     Smart slice function that provides backward compatibility with ff_slice while adding intelligent chunking.
     
     For segments <= max_segment_duration: Creates a single file at dst_path (like original ff_slice)
-    For segments > max_segment_duration: Creates intelligent chunks and concatenates them to dst_path
+    For segments > max_segment_duration: Creates intelligent chunks and either concatenates them or returns chunk list
     
     Args:
         src_path: Source audio file
-        dst_path: Destination file path (single output file)
+        dst_path: Destination file path (single output file or base name for chunks)
         start_time: Start time of the segment
         end_time: End time of the segment
         target_sr: Target sample rate
         target_ac: Target audio channels
         max_segment_duration: Threshold for using intelligent chunking
         min_chunk_duration: Minimum chunk duration for intelligent chunking
+        return_chunks: If True, returns list of chunk paths instead of concatenating them
     
     Returns:
-        Path to the created file (dst_path)
+        Path to the created file (if return_chunks=False) or list of chunk paths (if return_chunks=True)
     """
     if ffmpeg is None or log is None:
         print("ERROR: ffmpeg or log not initialized in ff_slice_smart.")
@@ -1583,12 +1585,59 @@ def ff_slice_smart(src_path: Path, dst_path: Path, start_time: float, end_time: 
     if segment_duration <= max_segment_duration:
         # Use regular ff_slice for short segments
         ff_slice(src_path, dst_path, start_time, end_time, target_ac)
-        return dst_path
+        if return_chunks:
+            return [dst_path]  # Return as list for consistency
+        else:
+            return dst_path
     
     # Use intelligent chunking for long segments
     log.info(f"Segment duration {segment_duration:.1f}s > {max_segment_duration}s. Using intelligent chunking.")
     
-    # Create temporary directory for chunks
+    if return_chunks:
+        # Return individual chunks instead of concatenating
+        temp_chunks_dir = dst_path.parent / f"temp_chunks_{dst_path.stem}"
+        ensure_dir_exists(temp_chunks_dir)
+        
+        try:
+            base_name = dst_path.stem
+            chunk_files = ff_slice_intelligent(
+                src_path=src_path,
+                dst_dir=temp_chunks_dir,
+                segment_start_time=start_time,
+                segment_end_time=end_time,
+                base_name=base_name,
+                target_sr=target_sr,
+                target_ac=target_ac,
+                max_segment_duration=max_segment_duration,
+                min_chunk_duration=min_chunk_duration
+            )
+            
+            if not chunk_files:
+                log.warning("No chunks created by intelligent chunking. Creating single fallback chunk.")
+                ff_slice(src_path, dst_path, start_time, end_time, target_ac)
+                return [dst_path]
+            
+            # Move chunks to final location with proper naming
+            final_chunks = []
+            for i, chunk_file in enumerate(chunk_files):
+                final_chunk_name = f"{dst_path.stem}_chunk{i+1:02d}{dst_path.suffix}"
+                final_chunk_path = dst_path.parent / final_chunk_name
+                shutil.move(str(chunk_file), str(final_chunk_path))
+                final_chunks.append(final_chunk_path)
+            
+            # Clean up temp directory
+            if temp_chunks_dir.exists():
+                shutil.rmtree(temp_chunks_dir, ignore_errors=True)
+            
+            log.info(f"Created {len(final_chunks)} chunks, returning individual chunk files for separate processing.")
+            return final_chunks
+            
+        except Exception as e:
+            log.error(f"Error in chunking mode: {e}. Falling back to single file.")
+            ff_slice(src_path, dst_path, start_time, end_time, target_ac)
+            return [dst_path]
+    
+    # Original concatenation behavior (return_chunks=False)
     temp_chunks_dir = dst_path.parent / f"temp_chunks_{dst_path.stem}"
     ensure_dir_exists(temp_chunks_dir)
     
@@ -1659,7 +1708,6 @@ def ff_slice_smart(src_path: Path, dst_path: Path, start_time: float, end_time: 
     finally:
         # Clean up temporary chunks directory
         if temp_chunks_dir.exists():
-            import shutil
             try:
                 shutil.rmtree(temp_chunks_dir)
                 log.debug(f"Cleaned up temporary chunks directory: {temp_chunks_dir}")

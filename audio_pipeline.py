@@ -10,10 +10,8 @@ verification, transcription, and concatenation.
 from __future__ import annotations
 import sys
 from pathlib import Path
-import numpy as np
 import shutil
 import time
-import csv
 import subprocess
 import os
 import re
@@ -83,21 +81,6 @@ from common import (
     safe_filename,
     format_duration,
 )
-import ffmpeg
-from rich.progress import (
-    Progress,
-    TextColumn,
-    BarColumn,
-    TimeElapsedColumn,
-    SpinnerColumn,
-)
-from rich.table import Table
-
-try:
-    from transformers import pipeline as transformers_pipeline
-    HAVE_TRANSFORMERS = True
-except ImportError:
-    HAVE_TRANSFORMERS = False
 
 # --- Model Initialization Functions ---
 def init_bandit_separator(model_checkpoint_path: Path) -> dict | None:
@@ -437,7 +420,7 @@ def init_wespeaker_models(
 
 def init_speechbrain_speaker_recognition_model(
     model_source: str = "speechbrain/spkrec-ecapa-voxceleb",
-) -> "SpeechBrainSpeakerRecognition" | None:
+):
     """Initializes the SpeechBrain SpeakerRecognition model (ECAPA-TDNN)."""
     if not HAVE_SPEECHBRAIN:
         log.warning(
@@ -862,11 +845,21 @@ def _process_single_file(
     if result.returncode == 0:
         expected_output = output_dir / "speech_estimate.wav"
         if expected_output.exists():
-            shutil.move(str(expected_output), str(final_output_path))
+            log.info(f"Found Bandit output at: {expected_output}")
+            shutil.copy(str(expected_output), str(final_output_path))
             log.info(
                 f"[green]✓ Bandit-v2 vocal separation completed. Vocals saved to: {final_output_path.name}[/]"
             )
             return final_output_path
+        else:
+            log.error(f"Expected Bandit output not found at: {expected_output}")
+            log.info(f"Contents of output directory {output_dir}:")
+            if output_dir.exists():
+                for item in output_dir.iterdir():
+                    log.info(f"  - {item.name}")
+            else:
+                log.error(f"Output directory {output_dir} does not exist")
+            return None
     else:
         print("\n========== BANDIT FULL ERROR OUTPUT ==========")
         print("STDERR:")
@@ -982,7 +975,7 @@ def _process_in_chunks(
                 expected_output = chunk_output_dir / "speech_estimate.wav"
                 if expected_output.exists():
                     chunk_output = temp_dir / f"chunk_{chunk_idx:03d}_vocals.wav"
-                    shutil.move(str(expected_output), str(chunk_output))
+                    shutil.copy(str(expected_output), str(chunk_output))
                     chunks_processed.append(
                         {
                             "path": chunk_output,
@@ -1808,7 +1801,7 @@ def verify_speaker_segment(
     segment_audio_path: Path,  # Path to the segment to verify (must be 16kHz mono for models)
     reference_audio_path: Path,  # Path to the reference audio (must be 16kHz mono)
     wespeaker_models: dict,  # Dict containing 'rvector' and 'gemini' WeSpeaker model instances
-    speechbrain_sb_model: "SpeechBrainSpeakerRecognition",  # SpeechBrain ECAPA-TDNN model instance
+    speechbrain_sb_model,  # SpeechBrain ECAPA-TDNN model instance
     verification_strategy: str = "weighted_average",  # or "sequential_gauntlet" (not fully implemented)
 ) -> tuple[float, dict]:
     """
@@ -1916,36 +1909,7 @@ def verify_speaker_segment(
     return final_score, scores
 
 
-def get_target_solo_timeline(
-    diarization_annotation: Annotation,
-    identified_target_label: str,
-    overlap_timeline: Timeline,
-) -> Timeline:
-    """Extracts timeline for the target speaker EXCLUDING overlapped regions."""
-    if (
-        not identified_target_label
-        or identified_target_label not in diarization_annotation.labels()
-    ):
-        log.warning(
-            f"Target label '{identified_target_label}' not in diarization. Cannot extract solo timeline."
-        )
-        return Timeline()
 
-    target_speaker_timeline = diarization_annotation.label_timeline(
-        identified_target_label
-    )
-    if not target_speaker_timeline:
-        log.info(
-            f"No speech segments for target '{identified_target_label}' in diarization."
-        )
-        return Timeline()
-
-    # .support() merges overlapping segments within the target_speaker_timeline itself.
-    # .extrude() subtracts the overlap_timeline from the target_speaker_timeline.
-    final_solo_timeline = target_speaker_timeline.support().extrude(
-        overlap_timeline.support()
-    )
-    return final_solo_timeline
 
 
 def slice_classify_clean_and_verify_target_solo_segments(
@@ -1954,9 +1918,8 @@ def slice_classify_clean_and_verify_target_solo_segments(
     original_audio_file: Path,
     output_dir_target_speaker: Path,
     tmp_dir_segments: Path,
-    reference_audio_path_processed: Path,
-    wespeaker_models: dict,
-    speechbrain_sb_model: "SpeechBrainSpeakerRecognition",
+    reference_audio_path_processed: Path,    wespeaker_models: dict,
+    speechbrain_sb_model,
     whisper_model_name: str,
     target_name: str,
     min_segment_duration: float,
@@ -1968,9 +1931,10 @@ def slice_classify_clean_and_verify_target_solo_segments(
     noise_classifier_model_id: str | None,
     bandit_model_checkpoint: Path | None,
     bandit_vocals_file: Path | None,
-    noise_classification_confidence_threshold: float = 0.3,
-    skip_verification_if_cleaned: bool = False,    whisper_model_instance = None,
+    noise_classification_confidence_threshold: float = 0.3,    skip_verification_if_cleaned: bool = False,
+    whisper_model_instance = None,
     language: str = "en",
+    max_segment_duration: float = 30.0,
 ) -> tuple[list[Path], list[dict]]:
     """
     Slices segments for the target speaker, optionally classifies/cleans them,
@@ -1980,12 +1944,12 @@ def slice_classify_clean_and_verify_target_solo_segments(
     Args:
         ...existing args...
         whisper_model_instance: Pre-loaded Whisper model instance for efficient transcription
-        language: Language code for transcription
-    """
+        language: Language code for transcription    """
     log.info(
         f"Processing segments for target speaker: '{target_name}' (Label: {target_speaker_label})"
     )
     ensure_dir_exists(tmp_dir_segments)
+    ensure_dir_exists(output_dir_target_speaker)
 
     verified_segment_audio_files = []
     all_segment_details = []
@@ -2052,345 +2016,207 @@ def slice_classify_clean_and_verify_target_solo_segments(
         segment_start_time = segment.start
         segment_end_time = segment.end
         segment_duration = segment.duration
-
+        
         segment_base_name = f"{safe_filename(target_name)}_seg{segment_idx:04d}_{segment_start_time:.2f}s_{segment_end_time:.2f}s"
         log.info(
             f"Processing segment {segment_idx + 1}/{len(final_segments_to_process)} for '{target_name}': {segment_base_name} ({segment_duration:.2f}s long)"
         )
 
-        segment_audio_path_for_verification = None
-        segment_classification = "N/A"
-        cleaned_by_bandit = False
-
         if classify_and_clean and noise_classifier_instance:
-            temp_segment_for_classification_path = (
-                tmp_dir_segments / f"{segment_base_name}_for_classify_16k_mono.wav"
-            )            
-            ff_slice_smart(
+            # Get chunks for classification
+            temp_segment_base_path = tmp_dir_segments / f"{segment_base_name}_for_classify_16k_mono.wav"
+            
+            classification_chunks = ff_slice_smart(
                 original_audio_file,
-                temp_segment_for_classification_path,
+                temp_segment_base_path,
                 segment_start_time,
                 segment_end_time,
                 target_sr=16000,
-                target_ac=1
+                target_ac=1,
+                max_segment_duration=max_segment_duration,
+                return_chunks=True
             )
-
-            if (
-                not temp_segment_for_classification_path.exists()
-                or temp_segment_for_classification_path.stat().st_size == 0
-            ):
-                log.warning(
-                    f"Failed to create segment for classification: {temp_segment_for_classification_path.name}. Skipping."
-                )
-                segment_audio_path_for_verification = (
-                    tmp_dir_segments / f"{segment_base_name}_original_16k_mono.wav"                )
-                ff_slice_smart(
-                    original_audio_file,
-                    segment_audio_path_for_verification,
-                    segment_start_time,
-                    segment_end_time,
-                    target_sr=16000,
-                    target_ac=1,
-                )
-                segment_classification = "unknown (slicing_failed)"
+            
+            # Handle both single file and multiple chunks
+            if isinstance(classification_chunks, list):
+                chunk_paths = classification_chunks
             else:
-                classification_result = noise_classifier_instance.classify(
-                    str(temp_segment_for_classification_path),
-                    confidence_threshold=noise_classification_confidence_threshold,                )
-                segment_classification = classification_result
-                log.info(
-                    f"Segment {segment_idx+1} classified as: {classification_result.upper()}"
-                )
-
-                if classification_result == "noisy" and bandit_model_checkpoint:
-                    log.info(
-                        f"Segment {segment_idx+1} is NOISY. Attempting Bandit-v2 cleaning."
-                    )
-                    # Keep noise classifier loaded - it's small and doesn't use much VRAM
-
-                    original_noisy_segment_for_bandit_path = (
-                        tmp_dir_segments
-                        / f"{segment_base_name}_original_for_bandit.wav"                    )
-                    ff_slice_smart(
-                        original_audio_file,
-                        original_noisy_segment_for_bandit_path,
-                        segment_start_time,
-                        segment_end_time,
-                        target_sr=16000,
-                        target_ac=1,
-                    )
-
-                    if (
-                        original_noisy_segment_for_bandit_path.exists()
-                        and original_noisy_segment_for_bandit_path.stat().st_size > 0
-                    ):
-                        bandit_output_dir_for_segment = (
-                            tmp_dir_segments / f"bandit_cleaned_{segment_idx}"
-                        )
-                        ensure_dir_exists(bandit_output_dir_for_segment)
-
-                        log.info(
-                            f"Running Bandit-v2 on: {original_noisy_segment_for_bandit_path.name}"
-                        )
-                        cleaned_segment_path_from_bandit = run_bandit_vocal_separation(
-                            input_audio_file=original_noisy_segment_for_bandit_path,
-                            bandit_separator=bandit_model_checkpoint,
-                            output_dir=bandit_output_dir_for_segment,
-                        )
-
-                        if (
-                            cleaned_segment_path_from_bandit
-                            and cleaned_segment_path_from_bandit.exists()
-                        ):
-                            log.info(
-                                f"Bandit-v2 cleaning successful. Output: {cleaned_segment_path_from_bandit.name}"
-                            )
-                            segment_audio_path_for_verification = (
-                                tmp_dir_segments
-                                / f"{segment_base_name}_cleaned_16k_mono.wav"
-                            )
-                            ff_trim(
-                                cleaned_segment_path_from_bandit,
-                                segment_audio_path_for_verification,
-                                0,
-                                9999,
-                                target_sr=16000,
-                                target_ac=1,
-                            )
-                            cleaned_by_bandit = True
-                            original_noisy_segment_for_bandit_path.unlink(
-                                missing_ok=True
-                            )
-                        else:
-                            log.warning(
-                                f"Bandit-v2 cleaning failed for segment {segment_idx+1}. Using original noisy segment."
-                            )
-                            segment_audio_path_for_verification = (
-                                temp_segment_for_classification_path
-                            )
-                            if original_noisy_segment_for_bandit_path.exists():
-                                original_noisy_segment_for_bandit_path.unlink(
-                                    missing_ok=True
-                                )
+                chunk_paths = [classification_chunks]
+                
+            log.info(f"Processing {len(chunk_paths)} chunks for segment {segment_idx+1}")
+            
+            # Process each chunk separately
+            chunk_results = []
+            for chunk_idx, chunk_path in enumerate(chunk_paths):
+                if not chunk_path or not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                    if chunk_path:
+                        log.warning(f"Chunk {chunk_idx+1} is missing or empty: {chunk_path.name}")
                     else:
-                        log.warning(
-                            f"Could not extract original segment {segment_idx+1} for Bandit. Using uncleaned segment."
-                        )
-                        segment_audio_path_for_verification = (
-                            temp_segment_for_classification_path
-                        )
-
-                elif classification_result == "noisy" and not bandit_model_checkpoint:
-                    log.warning(
-                        f"Segment {segment_idx+1} is NOISY, but no Bandit model provided. Using original noisy segment."
+                        log.warning(f"Chunk {chunk_idx+1} is None or failed to create")
+                    continue
+                    
+                chunk_classification = noise_classifier_instance.classify(
+                    str(chunk_path),
+                    confidence_threshold=noise_classification_confidence_threshold,
+                )
+                
+                log.info(f"Chunk {chunk_idx+1}/{len(chunk_paths)} classified as: {chunk_classification.upper()}")
+                  # Process this chunk based on classification
+                chunk_audio_path_for_verification = None
+                chunk_cleaned_by_bandit = False
+                
+                if chunk_classification == "noisy" and bandit_model_checkpoint:
+                    log.info(f"Chunk {chunk_idx+1} is NOISY. Attempting Bandit-v2 cleaning.")
+                    
+                    bandit_output_dir_for_chunk = tmp_dir_segments / f"bandit_cleaned_{segment_idx}_chunk{chunk_idx+1}"
+                    ensure_dir_exists(bandit_output_dir_for_chunk)
+                    
+                    cleaned_chunk_path = run_bandit_vocal_separation(
+                        input_audio_file=chunk_path,
+                        bandit_separator=bandit_model_checkpoint,
+                        output_dir=bandit_output_dir_for_chunk,
                     )
-                    segment_audio_path_for_verification = (
-                        temp_segment_for_classification_path
-                    )
+                    
+                    if cleaned_chunk_path and cleaned_chunk_path.exists():
+                        log.info(f"Bandit-v2 cleaning successful for chunk {chunk_idx+1}")
+                        chunk_audio_path_for_verification = tmp_dir_segments / f"{segment_base_name}_chunk{chunk_idx+1:02d}_cleaned_16k_mono.wav"
+                        # Copy cleaned chunk to verification path with proper format
+                        shutil.copy(str(cleaned_chunk_path), str(chunk_audio_path_for_verification))
+                        chunk_cleaned_by_bandit = True
+                        
+                        # Clean up the bandit output directory to save space
+                        if bandit_output_dir_for_chunk.exists():
+                            shutil.rmtree(bandit_output_dir_for_chunk, ignore_errors=True)
+                    else:
+                        log.warning(f"Bandit-v2 cleaning failed for chunk {chunk_idx+1}. Using original.")
+                        chunk_audio_path_for_verification = chunk_path
+                        
+                elif chunk_classification == "noisy" and not bandit_model_checkpoint:
+                    log.warning(f"Chunk {chunk_idx+1} is NOISY, but no Bandit model provided.")
+                    chunk_audio_path_for_verification = chunk_path
                 else:  # Clean or Unknown
-                    log.info(
-                        f"Segment {segment_idx+1} is CLEAN or classification UNKNOWN. Using original segment."
-                    )
-                    segment_audio_path_for_verification = (
-                        temp_segment_for_classification_path
-                    )
+                    log.info(f"Chunk {chunk_idx+1} is CLEAN or classification UNKNOWN.")
+                    chunk_audio_path_for_verification = chunk_path
+                
+                chunk_results.append({
+                    'chunk_idx': chunk_idx,
+                    'chunk_path': chunk_path,
+                    'verification_path': chunk_audio_path_for_verification,
+                    'classification': chunk_classification,
+                    'cleaned_by_bandit': chunk_cleaned_by_bandit                })
+            # We'll process verification for each chunk later in the verification section
 
         else:  # Not classify_and_clean, or no classifier instance
-            segment_audio_path_for_verification = (
-                tmp_dir_segments / f"{segment_base_name}_std_16k_mono.wav"            )
-            ff_slice_smart(
+            segment_base_path = tmp_dir_segments / f"{segment_base_name}_std_16k_mono.wav"
+            
+            # Use ff_slice_smart to get either a single file or multiple chunks
+            slice_result = ff_slice_smart(
                 audio_source_for_slicing,
-                segment_audio_path_for_verification,
+                segment_base_path,
                 segment_start_time,
                 segment_end_time,
                 target_sr=16000,
-                target_ac=1
+                target_ac=1,
+                max_segment_duration=max_segment_duration,
+                return_chunks=True
             )
-            segment_classification = "N/A (standard_flow)"
-
-        # --- Verification ---
-        if (
-            not segment_audio_path_for_verification
-            or not segment_audio_path_for_verification.exists()
-            or segment_audio_path_for_verification.stat().st_size == 0
-        ):
-            log.warning(
-                f"Segment {segment_idx+1} ({segment_base_name}) audio for verification is missing or empty. Skipping verification."
-            )
-            # Clean up the potentially created empty file
-            if (
-                segment_audio_path_for_verification
-                and segment_audio_path_for_verification.exists()
-            ):
-                segment_audio_path_for_verification.unlink(missing_ok=True)
-            all_segment_details.append(
-                {
-                    "index": segment_idx,
-                    "start": segment_start_time,
-                    "end": segment_end_time,
-                    "duration": segment_duration,
-                    "classification": segment_classification,
-                    "cleaned_by_bandit": cleaned_by_bandit,
-                    "verified": False,
-                    "verification_score": 0.0,
-                    "reason": "Audio for verification missing",
-                    "transcript": None,
-                    "output_file_path": None,
-                }
-            )
-            continue  # Move to the next segment
-
-        # VAD check before full verification (optional)
-        if vad_verification:
-            is_active_speech = check_voice_activity(segment_audio_path_for_verification)
-            if not is_active_speech:
-                log.info(
-                    f"Segment {segment_idx+1} ({segment_base_name}) failed VAD check (low voice activity). Skipping verification."
-                )
-                all_segment_details.append(
-                    {
-                        "index": segment_idx,
-                        "start": segment_start_time,
-                        "end": segment_end_time,
-                        "duration": segment_duration,
-                        "classification": segment_classification,
-                        "cleaned_by_bandit": cleaned_by_bandit,
-                        "verified": False,
-                        "verification_score": 0.0,
-                        "reason": "Failed VAD check",
-                        "transcript": None,
-                        "output_file_path": str(
-                            segment_audio_path_for_verification
-                        ),  # Keep path for record
-                    }
-                )
-                # Don't add to verified_segment_audio_files, but don't delete yet if needed for other logs/outputs
+            
+            # Handle both single file and multiple chunks  
+            if isinstance(slice_result, list):
+                chunk_paths = slice_result
+            else:
+                chunk_paths = [slice_result]
+                
+            log.info(f"Processing {len(chunk_paths)} chunks for segment {segment_idx+1}")
+            
+            # For standard flow, create chunk results without classification
+            chunk_results = []
+            for chunk_idx, chunk_path in enumerate(chunk_paths):
+                if chunk_path.exists() and chunk_path.stat().st_size > 0:
+                    chunk_results.append({
+                        'chunk_idx': chunk_idx,
+                        'chunk_path': chunk_path,
+                        'verification_path': chunk_path,
+                        'classification': 'N/A (standard_flow)',
+                        'cleaned_by_bandit': False
+                    })
+                else:
+                    if chunk_path:
+                        log.warning(f"Chunk {chunk_idx+1} is missing or empty: {chunk_path.name}")
+                    else:
+                        log.warning(f"Chunk {chunk_idx+1} is None or failed to create")
+            
+        # --- Verification (Process each chunk separately) ---
+        # Now we have chunk_results list with chunks to process
+        verified_chunks = []
+        
+        for chunk_result in chunk_results:
+            chunk_idx = chunk_result['chunk_idx']
+            chunk_path = chunk_result['verification_path']
+            chunk_classification = chunk_result['classification']
+            chunk_cleaned_by_bandit = chunk_result['cleaned_by_bandit']
+            
+            if not chunk_path or not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                log.warning(f"Chunk {chunk_idx+1} audio for verification is missing or empty. Skipping.")
                 continue
-
-        # Actual Speaker Verification
-        verification_score = 0.0
-        is_verified_segment = False
-
-        if skip_verification_if_cleaned and cleaned_by_bandit:
-            log.info(
-                f"Segment {segment_idx+1} was cleaned by Bandit. Skipping re-verification as per 'skip_verification_if_cleaned' flag."
-            )
-            is_verified_segment = True  # Assume clean means verified in this context
-            verification_score = 1.0  # Assign a nominal high score
-        else:
-            log.info(
-                f"Verifying segment {segment_idx+1}: {segment_audio_path_for_verification.name} against reference {reference_audio_path_processed.name}"
-            )
-            # Ensure reference audio is suitable (already done by prepare_reference_audio)
-            # Ensure segment audio is suitable (16kHz mono, handled by slicing above)
+            
+            # VAD check for this chunk
+            if vad_verification:
+                is_active_speech = check_voice_activity(chunk_path)
+                if not is_active_speech:
+                    log.info(f"Chunk {chunk_idx+1} failed VAD check (low voice activity). Skipping verification.")
+                    continue
+            
+            # Verify this individual chunk
+            log.info(f"Verifying chunk {chunk_idx+1}: {chunk_path.name} against reference")
+            
             final_score, all_scores = verify_speaker_segment(
-                segment_audio_path=segment_audio_path_for_verification,
+                segment_audio_path=chunk_path,
                 reference_audio_path=reference_audio_path_processed,
                 wespeaker_models=wespeaker_models,
                 speechbrain_sb_model=speechbrain_sb_model,
             )
-            verification_score = final_score
-            is_verified_segment = verification_score >= verification_threshold
-            log.info(
-                f"Segment {segment_idx+1} verification score: {verification_score:.4f} (Threshold: {verification_threshold}) -> Verified: {is_verified_segment}"
-            )
+            
+            is_verified_chunk = final_score >= verification_threshold
+            log.info(f"Chunk {chunk_idx+1} verification score: {final_score:.4f} (Threshold: {verification_threshold}) -> Verified: {is_verified_chunk}")
+            
+            if is_verified_chunk:                # Create verified chunk filename
+                final_verified_chunk_filename = f"{segment_base_name}_chunk{chunk_idx+1:02d}_verified_score{final_score:.2f}.wav"
+                final_verified_chunk_path = output_dir_target_speaker / final_verified_chunk_filename
+                
+                try:
+                    shutil.copy(str(chunk_path), str(final_verified_chunk_path))
+                    log.info(f"Saved verified chunk to: {final_verified_chunk_path.name}")
+                    verified_chunks.append(final_verified_chunk_path)
+                    
+                    # Note: Transcription will be handled in Stage 7 (batch processing)
+                    
+                except Exception as e_copy:
+                    log.error(f"Error copying verified chunk {chunk_idx+1}: {e_copy}")
+            
+            # Record details for this chunk
+            chunk_details = {
+                "index": f"{segment_idx}.{chunk_idx}",
+                "start": segment_start_time,
+                "end": segment_end_time,
+                "duration": segment_duration,
+                "chunk_idx": chunk_idx,
+                "classification": chunk_classification,
+                "cleaned_by_bandit": chunk_cleaned_by_bandit,
+                "verified": is_verified_chunk,
+                "verification_score": final_score,
+                "reason": "Verified" if is_verified_chunk else "Failed verification score",
+                "transcript": None,
+                "output_file_path": str(final_verified_chunk_path) if is_verified_chunk else None,
+            }
+            all_segment_details.append(chunk_details)
+          # Add verified chunks to the main list
+        verified_segment_audio_files.extend(verified_chunks)
+        
+        log.info(f"Processed {len(chunk_results)} chunks for segment {segment_idx+1}. {len(verified_chunks)} chunks verified.")
 
-        segment_details = {
-            "index": segment_idx,
-            "start": segment_start_time,
-            "end": segment_end_time,
-            "duration": segment_duration,
-            "classification": segment_classification,
-            "cleaned_by_bandit": cleaned_by_bandit,
-            "verified": is_verified_segment,
-            "verification_score": verification_score,
-            "reason": (
-                "Verified" if is_verified_segment else "Failed verification score"
-            ),
-            "transcript": None,
-            "output_file_path": str(segment_audio_path_for_verification),
-        }
-
-        if is_verified_segment:
-            # Move verified segment to final target speaker output directory
-            final_verified_segment_filename = (
-                f"{segment_base_name}_verified_score{verification_score:.2f}.wav"
-            )
-            final_verified_segment_path = (
-                output_dir_target_speaker / final_verified_segment_filename
-            )
-
-            # Ensure output_dir_target_speaker exists (should be created by caller, but double check)
-            ensure_dir_exists(output_dir_target_speaker)
-
-            try:
-                shutil.copy(
-                    str(segment_audio_path_for_verification),
-                    str(final_verified_segment_path),
-                )
-                log.info(
-                    f"Saved verified segment to: {final_verified_segment_path.name}"
-                )
-                verified_segment_audio_files.append(final_verified_segment_path)
-                segment_details["output_file_path"] = str(
-                    final_verified_segment_path
-                )  # Update with final path
-
-                # --- Transcription (Optional) ---
-                if transcribe_verified_segments and whisper_model_name:
-                    # Transcription uses the 16kHz mono verified segment
-                    log.info(
-                        f"Transcribing verified segment: {final_verified_segment_path.name} using Whisper model: {whisper_model_name}"
-                    )
-                    # Ensure Whisper model is loaded (transcribe_audio should handle this)
-                    # This might also have VRAM implications if Whisper is large and loaded/unloaded per segment.
-                    # For now, assume transcribe_audio handles its model efficiently or is called after all segments.
-                    # The current structure implies per-segment transcription.
-                    try:
-                        transcript_text = transcribe_audio(
-                            final_verified_segment_path,
-                            whisper_model_name,
-                            tmp_dir_segments,
-                            whisper_model_instance=whisper_model_instance,
-                            language=language
-                        )
-                        segment_details["transcript"] = transcript_text
-                        log.info(
-                            f"Transcript for {final_verified_segment_path.name}: {transcript_text}"
-                        )
-                    except Exception as e_transcribe:
-                        log.error(
-                            f"Transcription failed for {final_verified_segment_path.name}: {e_transcribe}"
-                        )
-                        segment_details["transcript"] = "[Transcription Error]"
-
-            except Exception as e_copy:
-                log.error(
-                    f"Error copying verified segment {segment_audio_path_for_verification.name} to {final_verified_segment_path}: {e_copy}"
-                )
-                segment_details["reason"] = "Verified, but failed to copy to output"
-                segment_details["output_file_path"] = None  # Indicate copy failure
-
-        all_segment_details.append(segment_details)
-
-        # Clean up the temporary segment used for verification if it's not the final path and still exists
-        if (
-            segment_audio_path_for_verification.exists()
-            and segment_audio_path_for_verification
-            != segment_details.get("output_file_path")
-        ):
-            segment_audio_path_for_verification.unlink(missing_ok=True)
-
-        # Clean up other specific temporary files created in this iteration if they haven't been moved or already deleted
-        # temp_segment_for_classification_path was handled earlier
-        # original_noisy_segment_for_bandit_path was handled earlier
-        # bandit_output_dir_for_segment and its contents (like cleaned_segment_path_from_bandit)
-        # are tricky if cleaned_segment_path_from_bandit was used to create segment_audio_path_for_verification.
-        # ff_trim creates a new file, so the source of ff_trim can be deleted if it was temporary.
-        # For now, major temp files created *and consumed* within the if/else blocks for classification/cleaning are handled.
-        # The segment_audio_path_for_verification is the key file that persists until copied or discarded.
-
-    # After loop, if noise classifier was used and potentially still loaded, unload it.
+        # Skip the old single-segment verification logic since we processed chunks
+        continue    # After loop, if noise classifier was used and potentially still loaded, unload it.
     if noise_classifier_instance:
         noise_classifier_instance.unload_model()
 
@@ -2512,26 +2338,49 @@ def transcribe_segments(
     elif model_to_use is not None:
         log.info(f"Using pre-loaded Whisper model for batch transcription of {len(segment_paths)} segments.")
 
+    # Use batch transcription for better performance
+    log.info(f"Batch transcribing {len(segment_paths)} segments with Whisper...")
+    
     transcripts = {}
-    for i, segment_path in enumerate(segment_paths, 1):
-        if not segment_path.exists() or segment_path.stat().st_size == 0:
-            log.warning(f"Segment file missing or empty: {segment_path.name}")
-            continue
-
-        try:
-            log.debug(f"Transcribing segment {i}/{len(segment_paths)}: {segment_path.name}")
-            transcript = transcribe_audio(
-                segment_path,
-                whisper_model_name,
-                output_dir,
-                whisper_model_instance=model_to_use,
-                language=language
-            )
-            if transcript:
-                transcripts[segment_path] = transcript
-                log.debug(f"Transcript for {segment_path.name}: {transcript}")
-        except Exception as e:
-            log.error(f"Failed to transcribe {segment_path.name}: {e}")
+    
+    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
+        task = pb.add_task("Transcribing segments...", total=len(segment_paths))
+        
+        for segment_path in segment_paths:
+            if not segment_path.exists():
+                log.warning(f"Segment file not found: {segment_path}")
+                pb.update(task, advance=1)
+                continue
+                
+            try:
+                # Use the loaded model for transcription
+                result = model_to_use.transcribe(
+                    str(segment_path),
+                    language=language,
+                    verbose=False,
+                    word_timestamps=False                )
+                
+                transcript_text = result.get("text", "").strip()
+                if transcript_text:
+                    transcripts[segment_path.name] = transcript_text
+                    log.debug(f"Transcribed '{segment_path.name}': {transcript_text[:100]}...")
+                    
+                    # Save transcript to file
+                    transcript_filename = f"{segment_path.stem}_transcript.txt"
+                    transcript_file_path = output_dir / transcript_filename
+                    try:
+                        with open(transcript_file_path, "w", encoding="utf-8") as f:
+                            f.write(transcript_text)
+                        log.debug(f"Saved transcript to: {transcript_filename}")
+                    except Exception as save_e:
+                        log.error(f"Failed to save transcript for {segment_path.name}: {save_e}")
+                else:
+                    log.warning(f"Empty transcription for: {segment_path.name}")
+                    
+            except Exception as e:
+                log.error(f"Failed to transcribe {segment_path.name}: {e}")
+                
+            pb.update(task, advance=1)
 
     total_transcribed = len(transcripts)
     log.info(f"[green]✓ Transcribed {total_transcribed} of {len(segment_paths)} {segment_label} segments for '{target_name}'.[/]")
@@ -2714,58 +2563,7 @@ def concatenate_segments(
             silence_file.unlink(missing_ok=True)
 
 
-def classify_segments_for_noise(
-    segment_paths: list[Path],
-    noise_threshold: float = 0.7
-) -> tuple[list[Path], list[Path]]:
-    """
-    Classifies audio segments as 'clean' or 'noisy' using a transformer model.
-    """
-    if not HAVE_TRANSFORMERS:
-        log.error("Transformers library not found. Cannot perform noise classification.")
-        return segment_paths, [] # Assume all are clean if library is missing
 
-    if not segment_paths:
-        return [], []
-
-    log.info(f"Classifying {len(segment_paths)} segments for noise with model 'Etherll/NoisySpeechDetection-v0.2'...")
-    
-    try:
-        classifier = transformers_pipeline(
-            "audio-classification", 
-            model="Etherll/NoisySpeechDetection-v0.2",
-            device=DEVICE
-        )
-    except Exception as e:
-        log.error(f"Failed to load NoisySpeechDetection model: {e}. Aborting classification.")
-        return segment_paths, []
-
-    clean_segments = []
-    noisy_segments = []
-
-    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
-        task = pb.add_task("Classifying noise...", total=len(segment_paths))
-        for segment_path in segment_paths:
-            try:
-                results = classifier(str(segment_path))
-                # Find the score for the 'clean' label
-                clean_score = next((item['score'] for item in results if item['label'] == 'clean'), 0.0)
-                
-                if clean_score >= noise_threshold:
-                    clean_segments.append(segment_path)
-                    log.debug(f"Segment '{segment_path.name}' classified as CLEAN (score: {clean_score:.3f})")
-                else:
-                    noisy_segments.append(segment_path)
-                    log.debug(f"Segment '{segment_path.name}' classified as NOISY (clean_score: {clean_score:.3f})")
-
-            except Exception as e:
-                log.warning(f"Could not classify segment {segment_path.name}: {e}. Assuming it's clean.")
-                clean_segments.append(segment_path)
-            
-            pb.update(task, advance=1)
-
-    log.info(f"Classification complete. Found {len(clean_segments)} clean segments and {len(noisy_segments)} noisy segments.")
-    return clean_segments, noisy_segments
 
 
 def run_bandit_on_noisy_segments(
@@ -2942,7 +2740,7 @@ def run_bandit_on_noisy_segments_subprocess(
                 if result.returncode == 0:
                     expected_output = segment_temp_output / "speech_estimate.wav"
                     if expected_output.exists():
-                        shutil.move(str(expected_output), str(cleaned_output_path))
+                        shutil.copy(str(expected_output), str(cleaned_output_path))
                         cleaned_segment_paths.append(cleaned_output_path)
                         log.debug(f"Successfully cleaned '{noisy_file.name}' -> '{cleaned_output_path.name}'")
                     else:
