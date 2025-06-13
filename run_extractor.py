@@ -274,7 +274,8 @@ from common import (
 )
 
 # Import pipeline functions AFTER setup
-try:    from audio_pipeline import (
+try:    
+    from audio_pipeline import (
         prepare_reference_audio,
         init_bandit_separator,
         run_bandit_vocal_separation,
@@ -591,7 +592,7 @@ def main(args):
         )
         log.info("Using standard logic: slice from Bandit output -> verify segments")
 
-    verified_solo_paths, rejected_solo_paths = slice_classify_clean_and_verify_target_solo_segments(
+    verified_solo_paths, all_segment_details = slice_classify_clean_and_verify_target_solo_segments(
         diarization_result=diarization_annotation,
         target_speaker_label=identified_target_label,
         original_audio_file=input_audio_p,
@@ -614,6 +615,14 @@ def main(args):
         noise_classification_confidence_threshold=args.noise_threshold,
         skip_verification_if_cleaned=False,
     )
+    
+    # Extract rejected segment paths from segment details
+    rejected_solo_paths = []
+    for segment_detail in all_segment_details:
+        if not segment_detail.get("verified", False) and segment_detail.get("output_file_path"):
+            rejected_path = Path(segment_detail["output_file_path"])
+            if rejected_path.exists():
+                rejected_solo_paths.append(rejected_path)
 
     # --- STAGE 7: Transcribe Segments (Whisper) ---
     if verified_solo_paths:

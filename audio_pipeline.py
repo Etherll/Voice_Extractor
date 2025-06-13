@@ -22,13 +22,27 @@ import tempfile
 os.environ["SPEECHBRAIN_FETCH_LOCAL_STRATEGY"] = "copy"  # For SpeechBrain on Windows
 
 import torch
-import soundfile as sf
+import torchaudio as ta
 import librosa
 from pyannote.audio import Pipeline as PyannotePipeline
 from pyannote.audio import Model as PyannoteModel
 from pyannote.audio.pipelines import OverlappedSpeechDetection as PyannoteOSDPipeline
 from pyannote.core import Segment, Timeline, Annotation
 import whisper
+import ffmpeg
+from rich.progress import (
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    SpinnerColumn,
+)
+from rich.table import Table
+
+try:
+    from transformers import pipeline as transformers_pipeline
+    HAVE_TRANSFORMERS = True
+except ImportError:
+    HAVE_TRANSFORMERS = False
 
 
 # Bandit-v2 (Vocal Separation)
@@ -63,8 +77,6 @@ from common import (
     ff_trim,
     ff_slice,
     cos,
-    to_mono,
-    plot_verification_scores,
     DEFAULT_MIN_SEGMENT_SEC,
     DEFAULT_MAX_MERGE_GAP,
     ensure_dir_exists,
@@ -86,26 +98,223 @@ try:
     HAVE_TRANSFORMERS = True
 except ImportError:
     HAVE_TRANSFORMERS = False
-    
-import yaml
 
 # --- Model Initialization Functions ---
-def init_bandit_separator(model_checkpoint_path: Path) -> Path | None:
-    """Returns the path to the Bandit-v2 checkpoint if valid."""
+def init_bandit_separator(model_checkpoint_path: Path) -> dict | None:
+    """
+    Loads and returns the Bandit-v2 model and required components.
+    
+    This optimized version loads the model once and returns a dict containing:
+    - system: The loaded PyTorch Lightning system with the model
+    - config: The Hydra configuration
+    - repo_path: Path to the Bandit-v2 repository
+    
+    Usage:
+        # Load model once
+        bandit_model = init_bandit_separator(checkpoint_path)
+        
+        # Use multiple times (much faster than CLI method)
+        vocals1 = run_bandit_vocal_separation(audio1, bandit_model, output_dir)
+        vocals2 = run_bandit_vocal_separation(audio2, bandit_model, output_dir)
+        vocals3 = run_bandit_vocal_separation(audio3, bandit_model, output_dir)
+    
+    Returns:
+        dict with loaded model components, or None if loading failed
+    """
+      # Set up logging fallback
+    import logging
+    try:
+        # Try to use the global log if available
+        if 'log' in globals() and log is not None:
+            logger = log
+        else:
+            raise AttributeError("Global log not available")
+    except (NameError, AttributeError):
+        # Fallback to basic logging
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        logger = logging.getLogger(__name__)
+      # Try to get DEVICE, with fallback
+    try:
+        device = DEVICE
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    except NameError:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     if not model_checkpoint_path.exists():
-        log.error(f"Bandit-v2 model checkpoint not found at: {model_checkpoint_path}")
+        logger.error(f"Bandit-v2 model checkpoint not found at: {model_checkpoint_path}")
         return None
-
+    
+    # Resolve the absolute checkpoint path FIRST, before changing working directory
+    absolute_checkpoint_path = model_checkpoint_path.resolve()    
     # Verify that the inference script exists
-    bandit_repo_path = Path(os.environ.get("BANDIT_REPO_PATH", "repos/bandit-v2"))
+    bandit_repo_path = Path(os.environ.get("BANDIT_REPO_PATH", "repos/bandit-v2")).resolve()
     inference_script = bandit_repo_path / "inference.py"
 
     if not inference_script.exists():
-        log.error(f"Bandit-v2 inference.py not found at: {inference_script}")
+        logger.error(f"Bandit-v2 inference.py not found at: {inference_script}")
         return None
 
-    log.info(f"[green]✓ Bandit-v2 checkpoint found: {model_checkpoint_path.name}[/]")
-    return model_checkpoint_path
+    logger.info(f"Loading Bandit-v2 model from checkpoint: {model_checkpoint_path.name}")
+
+    try:
+        # Add the bandit repo to sys.path to access its modules
+        if str(bandit_repo_path) not in sys.path:
+            sys.path.insert(0, str(bandit_repo_path))
+        
+        # Import required modules from bandit-v2
+        from src.system.utils import build_system
+        
+        # Load and prepare the config
+        config_path = bandit_repo_path / "expt" / "inference.yaml"
+        
+        if not config_path.exists():
+            logger.error(f"Bandit-v2 config file not found at: {config_path}")
+            return None
+            
+        # Read the config with Hydra/OmegaConf
+        with open(config_path, 'r') as f:
+            config_content = f.read()
+        
+        # Replace environment variables in config
+        repo_path_url = bandit_repo_path.as_posix()
+        config_content = config_content.replace('$REPO_ROOT', repo_path_url)
+        config_content = config_content.replace('data: dnr-v3-com-smad-multi-v2', 'data: dnr-v3-com-smad-multi-v2b')
+        
+        # Create a temporary config file for loading
+        temp_config_path = bandit_repo_path / "temp_inference_config.yaml"
+        with open(temp_config_path, 'w') as f:
+            f.write(config_content)
+        
+        try:
+            # Set environment variables for Hydra  
+            os.environ["HYDRA_FULL_ERROR"] = "1"
+            os.environ["REPO_ROOT"] = str(bandit_repo_path)
+            original_cwd = os.getcwd()
+            os.chdir(bandit_repo_path)
+            
+            # Initialize Hydra and load config
+            from hydra import initialize_config_dir, compose
+            from hydra.core.global_hydra import GlobalHydra
+            
+            # Clear any existing Hydra instance
+            if GlobalHydra().is_initialized():
+                GlobalHydra.instance().clear()
+            
+            # Try to load config with proper fallback handling
+            config_dir = (bandit_repo_path / "expt").resolve()
+            print("Using config directory:", config_dir)
+            try:
+                with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+                    # First try the original config name
+                    cfg = compose(config_name="v3-48k-smad-eng-test")
+            except Exception as e:
+                logger.warning(f"Could not load v3-48k-smad-eng-test config: {e}")
+                try:
+                    # Try without the problematic inference defaults
+                    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+                        cfg = compose(config_name="inference")
+                except Exception as e2:
+                    logger.warning(f"Could not load any Hydra config: {e2}")
+                    # Use direct model loading without build_system
+                    logger.info("Using direct model loading approach...")
+                    
+                    # Import model directly
+                    from src.models.bandit.bandit import Bandit
+                    
+                    # Create model with standard parameters matching the checkpoint
+                    model = Bandit(
+                        in_channels=1,  # Changed from 2 to 1 to match checkpoint
+                        stems=['speech'],
+                        fs=48000,
+                        band_type='musical',
+                        n_bands=64,
+                        normalize_channel_independently=False,
+                        treat_channel_as_feature=True,
+                        n_sqm_modules=8,
+                        emb_dim=128,
+                        rnn_dim=256,
+                        bidirectional=True,
+                        rnn_type='GRU',
+                        mlp_dim=512,
+                        hidden_activation='Tanh',
+                        hidden_activation_kwargs=None,
+                        complex_mask=True,
+                        use_freq_weights=True,
+                        n_fft=2048,
+                        win_length=2048,
+                        hop_length=512,
+                        window_fn='hann_window'
+                    )
+                    
+                    # Load the checkpoint directly into the model
+                    logger.info(f"Loading checkpoint weights from: {model_checkpoint_path}")
+                    
+                    # Use the pre-resolved absolute path for loading
+                    checkpoint = torch.load(str(absolute_checkpoint_path), map_location='cpu')
+                    
+                    # Extract just the model state dict if it's wrapped in a system
+                    if "state_dict" in checkpoint:
+                        state_dict = checkpoint["state_dict"]
+                        # Remove 'model.' prefix if present
+                        model_state_dict = {}
+                        for key, value in state_dict.items():
+                            if key.startswith('model.'):
+                                model_state_dict[key[6:]] = value
+                            else:
+                                model_state_dict[key] = value
+                        model.load_state_dict(model_state_dict, strict=False)
+                    else:
+                        model.load_state_dict(checkpoint, strict=False)
+                    
+                    # Move to device and set to eval mode
+                    model.to(device)
+                    model.eval()
+                    
+                    logger.info(f"✓ Bandit-v2 model loaded successfully on {device.type.upper()} (direct loading)")
+                    
+                    return {
+                        "system": model,  # For compatibility, store model as system
+                        "config": None,   # No config needed for direct loading
+                        "repo_path": bandit_repo_path,
+                        "direct_model": True  # Flag to indicate this is direct loading
+                    }
+            
+            # Override checkpoint path regardless of how we got the config
+            cfg.ckpt_path = str(model_checkpoint_path)
+            cfg.fs = 48000  # Bandit-v2 typically uses 48kHz
+            
+            # Build the system
+            system = build_system(cfg)
+            
+            # Load the checkpoint
+            logger.info(f"Loading checkpoint weights from: {model_checkpoint_path}")
+            checkpoint = torch.load(model_checkpoint_path, map_location='cpu')
+            system.load_state_dict(checkpoint["state_dict"], strict=False)
+            
+            # Move to device and set to eval mode
+            system.to(device)
+            system.eval()
+            
+            logger.info(f"✓ Bandit-v2 model loaded successfully on {device.type.upper()}")
+            
+            return {
+                "system": system,
+                "config": cfg,
+                "repo_path": bandit_repo_path
+            }
+                
+        finally:
+            # Cleanup
+            os.chdir(original_cwd)
+            if temp_config_path.exists():
+                temp_config_path.unlink()
+                
+    except Exception as e:
+        logger.error(f"Failed to load Bandit-v2 model: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return None
 
 
 def init_wespeaker_models(
@@ -403,15 +612,44 @@ def prepare_reference_audio(
 
 def run_bandit_vocal_separation(
     input_audio_file: Path,
-    bandit_separator: Path,  # Now it's clear this is the checkpoint path
+    bandit_separator,  # Can be either Path (old way) or dict (new loaded model way)
     output_dir: Path,
     chunk_minutes: float = 5.0,
 ) -> Path | None:
-    """Performs vocal separation using Bandit-v2 via subprocess."""
+    """Performs vocal separation using Bandit-v2. 
+    
+    Args:
+        bandit_separator: Either a Path to checkpoint (for subprocess method) 
+                         or a dict with loaded model (for direct method)
+    """
+    
+    # Check if we have a loaded model (new way) or checkpoint path (old way)
+    if isinstance(bandit_separator, dict) and "system" in bandit_separator:
+        # Use the new direct method with loaded model
+        return run_bandit_vocal_separation_direct(
+            input_audio_file, bandit_separator, output_dir, chunk_minutes
+        )
+    elif isinstance(bandit_separator, Path):
+        # Use the old subprocess method
+        return run_bandit_vocal_separation_subprocess(
+            input_audio_file, bandit_separator, output_dir, chunk_minutes
+        )
+    else:
+        log.error("Invalid bandit_separator: must be either a Path or a loaded model dict")
+        return None
+
+
+def run_bandit_vocal_separation_subprocess(
+    input_audio_file: Path,
+    bandit_separator: Path,  # Checkpoint path for subprocess method
+    output_dir: Path,
+    chunk_minutes: float = 5.0,
+) -> Path | None:
+    """Performs vocal separation using Bandit-v2 via subprocess (original method)."""
 
     checkpoint_path = bandit_separator
 
-    log.info(f"Starting vocal separation with Bandit-v2 for: {input_audio_file.name}")
+    log.info(f"Starting vocal separation with Bandit-v2 (subprocess) for: {input_audio_file.name}")
     ensure_dir_exists(output_dir)
 
     # Output filename for the vocals stem
@@ -565,8 +803,8 @@ def _process_single_file(
         "inference_temp",
         f"ckpt_path={checkpoint_path.resolve()}",
         f"+test_audio={input_file.resolve()}",
-        f"+output_path={output_dir.resolve()}",
-        f"+model_variant=speech",
+        f"--output_path={output_dir.resolve()}",
+        "--model_variant=speech",
     ]
 
     env = os.environ.copy()
@@ -679,10 +917,9 @@ def _process_in_chunks(
                 "--config-name",
                 "inference_temp",
                 f"ckpt_path={checkpoint_path.resolve()}",
-                f"+test_audio={chunk_input.resolve()}",
-                f"+output_path={chunk_output_dir.resolve()}",
-                f"+model_variant=speech",
-                "++inference.kwargs.inference_batch_size=1",  # FIX: Override batch size to 1
+                f"+test_audio={chunk_input.resolve()}",                f"--output_path={chunk_output_dir.resolve()}",
+                "--model_variant=speech",
+                "--inference.kwargs.inference_batch_size=1",  # FIX: Override batch size to 1
             ]
 
             env = os.environ.copy()
@@ -1284,11 +1521,8 @@ def identify_target_speaker(
                 log.debug(
                     f"Speaker label '{spk_label}' has no speech segments. Skipping."
                 )
-                continue
-
-            # Concatenate first N seconds of speech for this speaker to create a representative sample
+                continue            # Concatenate first N seconds of speech for this speaker to create a representative sample
             MAX_EMBED_DURATION_PER_SPEAKER = 20.0  # seconds
-            concatenated_speaker_audio_for_embedding = []
             current_duration_for_embedding = 0.0
 
             temp_speaker_audio_list = []
@@ -1826,8 +2060,7 @@ def slice_classify_clean_and_verify_target_solo_segments(
             else:
                 classification_result = noise_classifier_instance.classify(
                     str(temp_segment_for_classification_path),
-                    confidence_threshold=noise_classification_confidence_threshold,
-                )
+                    confidence_threshold=noise_classification_confidence_threshold,                )
                 segment_classification = classification_result
                 log.info(
                     f"Segment {segment_idx+1} classified as: {classification_result.upper()}"
@@ -1837,7 +2070,7 @@ def slice_classify_clean_and_verify_target_solo_segments(
                     log.info(
                         f"Segment {segment_idx+1} is NOISY. Attempting Bandit-v2 cleaning."
                     )
-                    noise_classifier_instance.unload_model()
+                    # Keep noise classifier loaded - it's small and doesn't use much VRAM
 
                     original_noisy_segment_for_bandit_path = (
                         tmp_dir_segments
@@ -2458,23 +2691,130 @@ def classify_segments_for_noise(
 
 def run_bandit_on_noisy_segments(
     noisy_paths: list[Path], 
-    bandit_separator_model: Path, 
+    bandit_separator_model,  # Can be either Path or loaded model dict
     output_dir_cleaned: Path,
     tmp_dir: Path
 ) -> list[Path]:
     """
     Runs Bandit-v2 vocal separation on a list of (small) noisy audio files.
+    Can use either subprocess method (with Path) or direct method (with loaded model).
     """
     if not noisy_paths:
         log.info("No noisy segments to process with Bandit-v2.")
         return []
 
-    if not bandit_separator_model or not bandit_separator_model.exists():
+    # Check if we have a loaded model or checkpoint path
+    if isinstance(bandit_separator_model, dict) and "system" in bandit_separator_model:
+        # Use direct method with loaded model
+        return run_bandit_on_noisy_segments_direct(
+            noisy_paths, bandit_separator_model, output_dir_cleaned, tmp_dir
+        )
+    elif isinstance(bandit_separator_model, Path):
+        # Use subprocess method
+        return run_bandit_on_noisy_segments_subprocess(
+            noisy_paths, bandit_separator_model, output_dir_cleaned, tmp_dir
+        )
+    else:
+        log.error("Invalid bandit_separator_model: must be either a Path or a loaded model dict")
+        return []
+
+
+def run_bandit_on_noisy_segments_direct(
+    noisy_paths: list[Path], 
+    bandit_model: dict,  # Loaded model dict
+    output_dir_cleaned: Path,
+    tmp_dir: Path
+) -> list[Path]:
+    """
+    Runs Bandit-v2 on noisy segments using the loaded model directly.
+    """
+    if not bandit_model or "system" not in bandit_model:
+        log.error("Bandit model not properly loaded")
+        return []
+        
+    system = bandit_model["system"]
+    cfg = bandit_model["config"]
+    
+    ensure_dir_exists(output_dir_cleaned)
+    log.info(f"Running Bandit-v2 (direct) on {len(noisy_paths)} noisy segments...")
+
+    cleaned_segment_paths = []
+    
+    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
+        task = pb.add_task("Cleaning noisy segments (direct)...", total=len(noisy_paths))
+        for noisy_file in noisy_paths:
+            cleaned_output_path = output_dir_cleaned / f"{noisy_file.stem}_cleaned.wav"
+            
+            try:
+                # Load the noisy audio
+                audio, fs = ta.load(str(noisy_file))
+                
+                # Resample if needed
+                if fs != cfg.fs:
+                    audio = ta.functional.resample(audio, fs, cfg.fs)
+                
+                # Ensure correct dimensions
+                if audio.dim() == 1:
+                    audio = audio.unsqueeze(0)  # Add channel dimension
+                
+                audio = audio.to(DEVICE)
+                
+                # Create batch
+                batch = {
+                    "mixture": {
+                        "audio": audio.unsqueeze(0),  # Add batch dimension
+                    }
+                }
+                
+                # Clear GPU cache before processing
+                if DEVICE.type == "cuda":
+                    torch.cuda.empty_cache()
+                
+                # Run inference
+                with torch.inference_mode():
+                    output = system.inference_handler(batch["mixture"]["audio"], system.model)
+                
+                # Extract vocals from output
+                if "estimates" in output and "speech" in output["estimates"]:
+                    vocals_audio = output["estimates"]["speech"]["audio"][0].cpu()
+                    
+                    # Save the cleaned segment
+                    ta.save(str(cleaned_output_path), vocals_audio, cfg.fs)
+                    
+                    if cleaned_output_path.exists() and cleaned_output_path.stat().st_size > 0:
+                        cleaned_segment_paths.append(cleaned_output_path)
+                        log.debug(f"Successfully cleaned '{noisy_file.name}' -> '{cleaned_output_path.name}'")
+                    else:
+                        log.warning(f"Cleaned output for '{noisy_file.name}' was not created or is empty")
+                else:
+                    log.warning(f"Expected 'speech' stem not found in Bandit output for '{noisy_file.name}'")
+                    
+            except Exception as e:
+                log.error(f"Error cleaning segment '{noisy_file.name}': {e}")
+                if "CUDA out of memory" in str(e):
+                    log.error("GPU out of memory during segment cleaning")
+            
+            pb.update(task, advance=1)
+
+    log.info(f"Bandit-v2 direct processing complete. Successfully cleaned {len(cleaned_segment_paths)} segments.")
+    return cleaned_segment_paths
+
+
+def run_bandit_on_noisy_segments_subprocess(
+    noisy_paths: list[Path], 
+    bandit_separator_model: Path, 
+    output_dir_cleaned: Path,
+    tmp_dir: Path
+) -> list[Path]:
+    """
+    Runs Bandit-v2 vocal separation on a list of (small) noisy audio files using subprocess.
+    """
+    if not bandit_separator_model.exists():
         log.error("Bandit-v2 model not available. Cannot clean noisy segments.")
         return []
     
     ensure_dir_exists(output_dir_cleaned)
-    log.info(f"Running Bandit-v2 on {len(noisy_paths)} noisy segments...")
+    log.info(f"Running Bandit-v2 (subprocess) on {len(noisy_paths)} noisy segments...")
 
     cleaned_segment_paths = []
     
@@ -2498,7 +2838,7 @@ def run_bandit_on_noisy_segments(
             f.write(config_content)
         
         with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
-            task = pb.add_task("Cleaning noisy segments...", total=len(noisy_paths))
+            task = pb.add_task("Cleaning noisy segments (subprocess)...", total=len(noisy_paths))
             for noisy_file in noisy_paths:
                 segment_temp_output = tmp_dir / f"bandit_out_{noisy_file.stem}"
                 ensure_dir_exists(segment_temp_output)
@@ -2506,11 +2846,10 @@ def run_bandit_on_noisy_segments(
                 
                 cmd = [
                     sys.executable, "inference.py",
-                    "--config-name", temp_config_path.stem,
-                    f"ckpt_path={bandit_separator_model.resolve()}",
-                    f"+test_audio={noisy_file.resolve()}",
-                    f"+output_path={segment_temp_output.resolve()}",
-                    f"+model_variant=speech"
+                    "--config-name", temp_config_path.stem,                    f"ckpt_path={bandit_separator_model.resolve()}",
+                    f"test_audio={noisy_file.resolve()}",
+                    f"--output_path={segment_temp_output.resolve()}",
+                    "--model_variant=speech"
                 ]
                 
                 env = os.environ.copy()
@@ -2543,16 +2882,248 @@ def run_bandit_on_noisy_segments(
         if temp_config_path.exists():
             temp_config_path.unlink()
 
-    log.info(f"Bandit-v2 processing complete. Successfully cleaned {len(cleaned_segment_paths)} segments.")
+    log.info(f"Bandit-v2 subprocess processing complete. Successfully cleaned {len(cleaned_segment_paths)} segments.")
     return cleaned_segment_paths
 
 
-if __name__ == "__main__":
-    log.info(
-        "audio_pipeline.py executed directly. This script is intended to be imported as a module."
+def run_bandit_vocal_separation_direct(
+    input_audio_file: Path,
+    bandit_model: dict,  # The loaded model dict from init_bandit_separator
+    output_dir: Path,
+    chunk_minutes: float = 5.0,
+) -> Path | None:
+    """Performs vocal separation using loaded Bandit-v2 model directly (no subprocess)."""
+    
+    # Set up logging fallback
+    import logging
+    try:
+        # Try to use the global log if available
+        if 'log' in globals() and log is not None:
+            logger = log
+        else:
+            raise AttributeError("Global log not available")
+    except (NameError, AttributeError):
+        # Fallback to basic logging
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        logger = logging.getLogger(__name__)
+    
+    if not bandit_model or "system" not in bandit_model:
+        logger.error("Bandit model not properly loaded")
+        return None
+        
+    system = bandit_model["system"]
+    cfg = bandit_model["config"]
+
+    # If config is None (direct loading), create minimal config
+    if cfg is None:
+        class MinimalConfig:
+            def __init__(self):
+                self.fs = 48000  # Bandit-v2 sample rate
+        cfg = MinimalConfig()
+
+    logger.info(f"Starting direct vocal separation with Bandit-v2 for: {input_audio_file.name}")
+    ensure_dir_exists(output_dir)    # Output filename for the vocals stem
+    vocals_output_filename = (
+        output_dir / f"{input_audio_file.stem}_vocals_bandit_v2.wav"
     )
-    # Add test calls here if needed for individual functions
-    # Example:
-    # log.info(f"Bandit-v2 available: {HAVE_BANDIT_V2}")
-    # log.info(f"WeSpeaker available: {HAVE_WESPEAKER}")
-    # log.info(f"SpeechBrain available: {HAVE_SPEECHBRAIN}")
+    
+    if vocals_output_filename.exists() and vocals_output_filename.stat().st_size > 0:
+        logger.info(
+            f"Found existing Bandit-v2 vocals, skipping separation: {vocals_output_filename.name}"
+        )
+        return vocals_output_filename
+
+    try:
+        # Load audio with torchaudio
+        audio, fs = ta.load(str(input_audio_file))
+        logger.info(f"Loaded audio: {audio.shape}, fs: {fs}")
+
+        # Resample if needed (Bandit-v2 typically expects 48kHz)
+        if fs != cfg.fs:
+            logger.info(f"Resampling from {fs}Hz to {cfg.fs}Hz")
+            audio = ta.functional.resample(audio, fs, cfg.fs)        # Check if we need to process in chunks
+        duration_seconds = audio.shape[-1] / cfg.fs
+        duration_minutes = duration_seconds / 60
+        
+        if duration_minutes > chunk_minutes:
+            logger.info(f"Audio is {duration_minutes:.1f} minutes. Processing in chunks...")
+            return _process_audio_in_chunks_direct(
+                audio, cfg.fs, system, vocals_output_filename, chunk_minutes
+            )
+        else:
+            logger.info(f"Audio is {duration_minutes:.1f} minutes. Processing as single file...")
+            return _process_audio_single_direct(audio, cfg.fs, system, vocals_output_filename)
+
+    except Exception as e:
+        logger.error(f"Bandit-v2 direct vocal separation failed: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return None
+
+
+def _process_audio_single_direct(
+    audio: torch.Tensor,
+    sample_rate: int,
+    system,
+    output_path: Path
+) -> Path | None:
+    """Process audio directly with the loaded Bandit model."""
+    
+    # Set up logging fallback
+    import logging
+    try:
+        # Try to use the global log if available
+        if 'log' in globals() and log is not None:
+            logger = log
+        else:
+            raise AttributeError("Global log not available")
+    except (NameError, AttributeError):
+        # Fallback to basic logging
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        logger = logging.getLogger(__name__)
+    
+    try:
+        # Ensure audio is on the right device and has correct dimensions
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)  # Add channel dimension
+        
+        audio = audio.to(DEVICE)
+          # Create batch
+        batch = {
+            "mixture": {
+                "audio": audio.unsqueeze(0),  # Add batch dimension
+            }
+        }
+
+        logger.info("Running inference with Bandit-v2 model...")
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Bandit-v2 (direct)...", total=None)
+            
+            with torch.inference_mode():
+                # Check if this is a direct model (without system wrapper) or a system
+                if hasattr(system, 'inference_handler') and hasattr(system, 'model'):
+                    # This is a system with inference handler
+                    output = system.inference_handler(batch["mixture"]["audio"], system.model)
+                else:
+                    # This is a direct model, call forward method directly
+                    output = system(batch)
+            
+            progress.update(task, completed=1, total=1)
+
+        # Extract vocals from output
+        if "estimates" in output and "speech" in output["estimates"]:
+            vocals_audio = output["estimates"]["speech"]["audio"][0].cpu()
+              # Save the vocals
+            ta.save(str(output_path), vocals_audio, sample_rate)
+            
+            if output_path.exists() and output_path.stat().st_size > 0:
+                logger.info(f"[green]✓ Bandit-v2 direct separation completed: {output_path.name}[/]")
+                return output_path
+            else:
+                logger.error("Output file was not created or is empty")
+                return None
+        else:
+            logger.error("Expected 'speech' stem not found in Bandit output")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error in direct Bandit processing: {e}")
+        if "CUDA out of memory" in str(e):
+            logger.error("GPU out of memory. Try reducing chunk_minutes or using a smaller audio file.")
+        return None
+
+
+def _process_audio_in_chunks_direct(
+    audio: torch.Tensor,
+    sample_rate: int,
+    system,
+    output_path: Path,
+    chunk_minutes: float
+) -> Path | None:
+    """Process audio in chunks directly with the loaded Bandit model."""
+    
+    try:
+        # Ensure audio has correct dimensions
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)  # Add channel dimension
+            
+        total_samples = audio.shape[-1]
+        chunk_samples = int(chunk_minutes * 60 * sample_rate)
+        crossfade_samples = int(0.5 * sample_rate)  # 0.5 second crossfade
+        
+        chunks_processed = []
+        chunk_idx = 0
+        
+        for start_idx in range(0, total_samples, chunk_samples):
+            # Calculate chunk boundaries with crossfade
+            actual_start = max(0, start_idx - crossfade_samples if chunk_idx > 0 else start_idx)
+            end_idx = min(total_samples, start_idx + chunk_samples)
+            actual_end = min(total_samples, end_idx + crossfade_samples if end_idx < total_samples else end_idx)
+            
+            log.info(f"Processing chunk {chunk_idx + 1} ({actual_start/sample_rate/60:.1f}-{actual_end/sample_rate/60:.1f} min)")
+            
+            # Extract chunk
+            chunk_audio = audio[:, actual_start:actual_end].to(DEVICE)
+            
+            # Create batch for this chunk
+            batch = {
+                "mixture": {
+                    "audio": chunk_audio.unsqueeze(0),  # Add batch dimension
+                }
+            }
+            
+            # Clear GPU cache before processing
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+            
+            with torch.inference_mode():
+                output = system.inference_handler(batch["mixture"]["audio"], system.model)
+            
+            if "estimates" in output and "speech" in output["estimates"]:
+                chunk_vocals = output["estimates"]["speech"]["audio"][0].cpu()
+                chunks_processed.append({
+                    "audio": chunk_vocals,
+                    "start_idx": actual_start,
+                    "original_start": start_idx,
+                    "original_end": end_idx
+                })
+            else:
+                log.error(f"Chunk {chunk_idx + 1} processing failed - no speech output")
+                return None
+                
+            chunk_idx += 1
+        
+        if not chunks_processed:
+            log.error("No chunks were successfully processed")
+            return None
+            
+        # Concatenate chunks
+        log.info(f"Concatenating {len(chunks_processed)} chunks...")
+        
+        if len(chunks_processed) == 1:
+            final_audio = chunks_processed[0]["audio"]
+        else:
+            # Simple concatenation for now (could add crossfading)
+            final_audio = torch.cat([chunk["audio"] for chunk in chunks_processed], dim=-1)
+        
+        # Save final result
+        ta.save(str(output_path), final_audio, sample_rate)
+        
+        if output_path.exists() and output_path.stat().st_size > 0:
+            log.info(f"[green]✓ Bandit-v2 direct chunked separation completed: {output_path.name}[/]")
+            return output_path
+        else:
+            log.error("Output file was not created or is empty")
+            return None
+            
+    except Exception as e:
+        log.error(f"Error in chunked direct Bandit processing: {e}")
+        if "CUDA out of memory" in str(e):
+            log.error("GPU out of memory. Try reducing chunk_minutes.")
+        return None
