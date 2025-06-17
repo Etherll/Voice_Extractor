@@ -34,7 +34,6 @@ REQ = [
     "torch>=2.5.0", "torchaudio>=2.5.0", "torchvision>=0.20.0",  # Changed from >=2.7.0
     "pyannote.audio>=3.3.2",
     "openai-whisper>=20240930",
-    "nemo_toolkit[asr]",  # Nvidia Parakeet TDT ASR support
     "matplotlib", "librosa",
     "speechbrain>=1.0.0",
     "torchcrepe>=0.0.21",
@@ -48,18 +47,11 @@ REQ = [
     "onnxruntime",
     "fairseq==0.12.2 --no-deps",
     "transformers",
-    "audio_separator[gpu]"
 
 ]
 
 # Model configurations - will be conditionally downloaded
 MODEL_CONFIGS = {
-    'bandit_checkpoint_eng': {
-        'url': 'https://zenodo.org/records/12701995/files/checkpoint-eng.ckpt?download=1',
-        'path': 'models/bandit_checkpoint_eng.ckpt',
-        'size': '~450MB',
-        'component': 'bandit'  # Which component needs this
-    }
 }
 
 def _ensure(pkgs):
@@ -1321,3 +1313,77 @@ def ff_slice_smart(src_path: Path, dst_path: Path, start_time: float, end_time: 
                 log.debug(f"Cleaned up temporary chunks directory: {temp_chunks_dir}")
             except Exception as e:
                 log.warning(f"Could not clean up temporary directory {temp_chunks_dir}: {e}")
+def ensure_models(component_usage=None):
+    """Download only required models based on component usage"""
+    if component_usage is None:
+        component_usage = {'use_speechbrain': True}
+    
+    logger_func = log.info if log else print
+    logger_func("[Setup] Checking required models based on component usage...")
+    
+    models_to_download = []
+    
+    for model_name, config in MODEL_CONFIGS.items():
+        # Check if this model's component is being used
+        component = config.get('component', '')
+        
+        should_download = False
+        if component == '' or component is None:  # Models without specific component are always needed
+            should_download = True
+        
+        if should_download:
+            model_path = Path(config['path'])
+            if not model_path.exists():
+                models_to_download.append((model_name, config, model_path))
+    
+    if models_to_download:
+        logger_func(f"[Setup] Need to download {len(models_to_download)} model(s):")
+        for name, config, _ in models_to_download:
+            logger_func(f"  - {name} ({config['size']})")
+        
+        for model_name, config, model_path in models_to_download:
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                download_with_progress(config['url'], model_path)
+                logger_func(f"[Setup] ✓ Downloaded {model_name}")
+            except Exception as e:
+                logger_func_err = log.error if log else print
+                logger_func_err(f"[Setup] ERROR: Failed to download {model_name}: {e}")
+                sys.exit(1)
+    else:
+        logger_func("[Setup] ✓ All required models are already present")
+
+def ensure_repositories(component_usage=None):
+    """Clone and set up required repositories based on component usage"""
+    if component_usage is None:
+        component_usage = {'use_speechbrain': True}
+    
+    _ensure(REQ)
+    _import_dependencies()
+    
+    logger_func = log.info if log else print
+
+    # Check for git
+    if shutil.which("git") is None:
+        logger_func("[Setup] ERROR: Git is not installed or not in PATH. Please install Git first.")
+        logger_func("  - Windows: https://git-scm.com/download/win")
+        logger_func("  - Or via winget: winget install Git.Git")
+        sys.exit(1)
+
+    repos_dir = Path("repos")
+    repos_dir.mkdir(exist_ok=True)
+
+    logger_func("[Setup] ✓ Repository setup complete")
+
+
+if __name__ == '__main__':
+    # For testing
+    component_usage = {
+        'use_speechbrain': True,
+    }
+    ensure_repositories(component_usage)
+    ensure_models(component_usage)
+    if log:
+        log.info("common.py executed directly (likely for testing). Dependencies should be loaded.")
+    else:
+        print("common.py executed directly. Log not initialized (unexpected).")
