@@ -1,0 +1,11 @@
+*.pyc
+*.wav
+*.mp4
+*.arrow
+*.json
+*.txt
+*.png
+*.m4a
+*.ckpt
+*.flac
+*.mp3

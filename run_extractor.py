@@ -6,7 +6,7 @@ run_extractor.py - Advanced Voice Extractor
 
 Processes an input audio file to identify, isolate (solo segments),
 verify, and transcribe segments of a target speaker.
-Uses Bandit-v2 for vocal separation, PyAnnote for diarization/OSD,
+Uses Audio Separator (Mel-Roformer) for vocal separation, PyAnnote for diarization/OSD,
 WeSpeaker & SpeechBrain for speaker ID/verification, and Whisper for ASR.
 """
 import sys
@@ -20,8 +20,7 @@ import torch
 import os
 
 # Parse arguments FIRST to know what components are needed
-parser = argparse.ArgumentParser(
-    description="Advanced Voice Extractor for TTS data preparation. Uses Bandit-v2, PyAnnote 3.1, WeSpeaker, "
+parser = argparse.ArgumentParser(    description="Advanced Voice Extractor for TTS data preparation. Uses Audio Separator (Mel-Roformer), PyAnnote 3.1, WeSpeaker, "
     "SpeechBrain, and Whisper.",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
@@ -66,10 +65,10 @@ path_group.add_argument(
     help="Sample rate for final extracted and concatenated SOLO audio segments (Hz).",
 )
 path_group.add_argument(
-    "--bandit-repo-path",
+    "--audio-separator-model",
     type=str,
-    default=os.getenv("BANDIT_REPO_PATH", "repos/bandit-v2"),
-    help="Path to the cloned kwatcharasupat/bandit-v2 repository. If not set, attempts to use PYTHONPATH.",
+    default="model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+    help="Audio Separator model filename (Mel-Roformer model for vocal separation).",
 )
 
 # Authentication Arguments
@@ -84,12 +83,6 @@ auth_group.add_argument(
 
 # Model Configuration Arguments
 model_group = parser.add_argument_group("Model Configuration Arguments")
-model_group.add_argument(
-    "--bandit-model-path",
-    type=str,
-    default="models/bandit_checkpoint_eng.ckpt",
-    help="Path to the Bandit-v2 .ckpt model file (e.g., checkpoint-eng.ckpt). Required if Bandit is not skipped.",
-)
 model_group.add_argument(
     "--wespeaker-rvector-model",
     type=str,
@@ -120,6 +113,19 @@ model_group.add_argument(
     default="large-v3",
     help="Whisper model name for transcription (e.g., tiny, base, small, medium, large, large-v2, large-v3).",
 )
+model_group.add_argument(
+    "--nemo-asr-model",
+    type=str,
+    default="nvidia/parakeet-tdt-0.6b-v2",
+    help="NeMo ASR model name for transcription (e.g., nvidia/parakeet-tdt-0.6b-v2).",
+)
+model_group.add_argument(
+    "--asr-engine",
+    type=str,
+    default="nemo",
+    choices=["whisper", "nemo"],
+    help="ASR engine to use for transcription (whisper or nemo).",
+)
 
 # Processing Control Arguments
 proc_group = parser.add_argument_group("Processing Control Arguments")
@@ -127,7 +133,7 @@ proc_group.add_argument(
     "--language",
     type=str,
     default="en",
-    help="Language code for Whisper transcription (e.g., 'en', 'es', 'auto' for Whisper only).",
+    help="Language code for Whisper transcription (e.g., 'en', 'es', 'auto'). Note: Only used by Whisper, not by NeMo ASR.",
 )
 proc_group.add_argument(
     "--diar-hyperparams",
@@ -136,9 +142,9 @@ proc_group.add_argument(
     help="JSON string of hyperparameters for PyAnnote diarization pipeline.",
 )
 proc_group.add_argument(
-    "--skip-bandit",
+    "--skip-audio-separator",
     action="store_true",
-    help="Skip Bandit-v2 vocal separation stage (use original audio for downstream).",
+    help="Skip Audio Separator vocal separation stage (use original audio for downstream).",
 )
 proc_group.add_argument(
     "--disable-speechbrain",
@@ -162,9 +168,14 @@ proc_group.add_argument(
     help="Pre-load Whisper model at startup (can save time if RAM is sufficient).",
 )
 proc_group.add_argument(
+    "--preload-nemo",
+    action="store_true", 
+    help="Pre-load NeMo ASR model at startup (can save time if RAM is sufficient).",
+)
+proc_group.add_argument(
     "--classify-and-clean",
     action="store_true",
-    help="After verification, classify segments as clean/noisy and run Bandit-v2 on only the noisy ones.",
+    help="After verification, classify segments as clean/noisy and run Audio Separator on only the noisy ones.",
 )
 
 # Fine-tuning Parameters for SOLO Segments
@@ -264,8 +275,7 @@ def add_toolkit_path_to_sys(toolkit_path_str: str | None, toolkit_name: str):
             )
 
 
-if args.bandit_repo_path and not args.skip_bandit:
-    add_toolkit_path_to_sys(args.bandit_repo_path, "Bandit-v2")
+# Audio Separator doesn't need any special path setup since it's installed via pip
 
 # --- Bootstrap Dependencies with component info ---
 try:
@@ -273,7 +283,7 @@ try:
 
     # Pass component usage info to ensure_repositories and ensure_models
     component_usage = {
-        "use_bandit": not args.skip_bandit,
+        "use_audio_separator": not args.skip_audio_separator,
         "use_speechbrain": not args.disable_speechbrain,
     }
     ensure_repositories(component_usage)
@@ -316,11 +326,11 @@ except ImportError:
     create_dataset_from_run_output = None
 
 # Import pipeline functions AFTER setup
-try:    
-    from audio_pipeline import (
+try:      from audio_pipeline import (
         prepare_reference_audio,
-        init_bandit_separator,
-        run_bandit_vocal_separation,
+        init_audio_separator,
+        init_nemo_asr_model,
+        run_audio_separator_vocal_separation,
         diarize_audio,
         detect_overlapped_regions,
         init_wespeaker_models,
@@ -328,20 +338,18 @@ try:
         init_speechbrain_speaker_recognition_model,        slice_classify_clean_and_verify_target_solo_segments,
         transcribe_segments,
         concatenate_segments,
-        HAVE_BANDIT_V2,
+        HAVE_AUDIO_SEPARATOR,
         HAVE_WESPEAKER,
         HAVE_SPEECHBRAIN,
-    )
+        HAVE_NEMO_ASR,    )
 except ImportError as e_pipeline_import:
     log.error(
         f"[bold red]FATAL: Failed to import functions from audio_pipeline.py: {e_pipeline_import}[/]"
     )
     log.error(
         "This might be due to errors in audio_pipeline.py, missing toolkit dependencies, "
-        "or issues with PYTHONPATH for Bandit-v2 if its repo path was not provided or is incorrect."
+        "or issues with required dependencies."
     )
-    if args.bandit_repo_path:
-        log.error(f"  Bandit-v2 repo path used: {args.bandit_repo_path}")
     sys.exit(1)
 
 
@@ -373,12 +381,14 @@ def main(args):
         sys.exit(1)
     if not target_name_str.strip():
         log.error("[bold red]Target name cannot be empty. Exiting.[/]")
-        sys.exit(1)
-
-    # Check if critical toolkits are available based on imports and args
-    if (not args.skip_bandit or args.classify_and_clean) and not HAVE_BANDIT_V2:
+        sys.exit(1)    # Check if critical toolkits are available based on imports and args    if (not args.skip_audio_separator or args.classify_and_clean) and not HAVE_AUDIO_SEPARATOR:
         log.error(
-            "[bold red]Bandit-v2 is required for this workflow but its library/repository was not found. Check installation and --bandit-repo-path. Exiting.[/]"
+            "[bold red]Audio Separator is required for this workflow but was not found. Please install with: pip install audio-separator[/]"
+        )
+        sys.exit(1)
+    if args.asr_engine == "nemo" and not HAVE_NEMO_ASR:
+        log.error(
+            "[bold red]NeMo ASR is requested but not available. Please install with: pip install nemo_toolkit[asr][/]"
         )
         sys.exit(1)
     if not HAVE_WESPEAKER:
@@ -392,10 +402,9 @@ def main(args):
         f"{safe_filename(target_name_str)}_{input_audio_p.stem}_extracted"
     )
     output_dir = Path(args.output_base_dir) / run_output_dir_name
-    run_tmp_dir = output_dir / "__tmp_processing"
-
-    # Specific output subdirectories
-    separated_vocals_dir = output_dir / "separated_vocals_bandit"
+    run_tmp_dir = output_dir / "__tmp_processing"    # Specific output subdirectories
+    separated_vocals_dir = output_dir / "separated_vocals_audio_separator"
+    separated_instrumental_dir = output_dir / "separated_instrumental_audio_separator"
     segments_base_output_dir = output_dir / "target_segments_solo"
     transcripts_verified_dir = output_dir / "transcripts_solo_verified_whisper"
     transcripts_rejected_dir = output_dir / "transcripts_solo_rejected_whisper"
@@ -406,6 +415,7 @@ def main(args):
         output_dir,
         run_tmp_dir,
         separated_vocals_dir,
+        separated_instrumental_dir,
         segments_base_output_dir,
         transcripts_verified_dir,
         transcripts_rejected_dir,
@@ -427,17 +437,12 @@ def main(args):
     )
     # --- STAGE 0: Initialize Models ---
     log.info("[bold magenta]== STAGE 0: Initializing Models ==[/]")
-    bandit_separator_model = None
-    if not args.skip_bandit:
-        if not args.bandit_model_path:
+    audio_separator_model = None
+    if not args.skip_audio_separator:
+        audio_separator_model = init_audio_separator(args.audio_separator_model)
+        if audio_separator_model is None:
             log.error(
-                "[bold red]--bandit-model-path is required for this workflow. Exiting.[/]"
-            )
-            sys.exit(1)
-        bandit_separator_model = init_bandit_separator(Path(args.bandit_model_path))
-        if bandit_separator_model is None:
-            log.error(
-                "[bold red]Failed to initialize Bandit-v2 model, which is required for this workflow. Exiting.[/]"
+                "[bold red]Failed to initialize Audio Separator model, which is required for this workflow. Exiting.[/]"
             )
             sys.exit(1)
     if not args.wespeaker_rvector_model or not args.wespeaker_gemini_model:
@@ -474,7 +479,10 @@ def main(args):
         log.info("SpeechBrain ECAPA-TDNN verification is disabled by user.")
 
     whisper_asr_model = None
-    if args.preload_whisper:
+    nemo_asr_model = None
+    
+    # Pre-load ASR models if requested
+    if args.preload_whisper or args.asr_engine == "whisper":
         try:
             log.info(
                 f"Pre-loading Whisper model '{args.whisper_model}' to {DEVICE.type.upper()}..."
@@ -488,6 +496,19 @@ def main(args):
                 f"Failed to pre-load Whisper model: {e_preload_whisper}. Will attempt to load during transcription stage."
             )
             whisper_asr_model = None
+    if args.preload_nemo:
+        try:
+            log.info(f"Pre-loading NeMo ASR model '{args.nemo_asr_model}' to {DEVICE.type.upper()}...")
+            nemo_asr_model = init_nemo_asr_model(args.nemo_asr_model)
+            if nemo_asr_model:
+                log.info(f"NeMo ASR model '{args.nemo_asr_model}' pre-loaded.")
+            else:
+                log.warning(f"Failed to pre-load NeMo ASR model. Will attempt to load during transcription stage.")
+        except Exception as e_preload_nemo:
+            log.error(
+                f"Failed to pre-load NeMo ASR model: {e_preload_nemo}. Will attempt to load during transcription stage."
+            )
+            nemo_asr_model = None
 
     # --- STAGE 1: Prepare Reference Audio ---
     log.info("[bold magenta]== STAGE 1: Reference Audio Preparation ==[/]")
@@ -508,37 +529,51 @@ def main(args):
         visualizations_output_dir,
         "00_Processed_ReferenceAudio_16kMono",
         target_name_str,
-    )  # --- STAGE 2: Vocal Separation (Bandit-v2) ---
+    )
+    
+    # --- STAGE 2: Vocal Separation (Audio Separator Mel-Roformer) ---
     source_for_diarization_osd = input_audio_p
-    bandit_vocals_file = None
-    if not args.skip_bandit and not args.classify_and_clean and bandit_separator_model:
-        log.info("[bold magenta]== STAGE 2: Initial Vocal Separation (Bandit-v2) ==[/]")
-        bandit_vocals_file = run_bandit_vocal_separation(
-            input_audio_p, bandit_separator_model, separated_vocals_dir
+    audio_separator_vocals_file = None
+    audio_separator_instrumental_file = None
+    if not args.skip_audio_separator and not args.classify_and_clean and audio_separator_model:
+        log.info("[bold magenta]== STAGE 2: Initial Vocal Separation (Audio Separator Mel-Roformer) ==[/]")
+        audio_separator_vocals_file, audio_separator_instrumental_file = run_audio_separator_vocal_separation(
+            input_audio_p, audio_separator_model, separated_vocals_dir, separated_instrumental_dir
         )
-        if bandit_vocals_file and bandit_vocals_file.exists():
+        
+        if audio_separator_vocals_file and audio_separator_vocals_file.exists():
             save_detailed_spectrograms(
-                bandit_vocals_file,
+                audio_separator_vocals_file,
                 visualizations_output_dir,
-                "02a_BanditV2_Vocals_Only",
+                "02a_AudioSeparator_Vocals_Only",
                 target_name_str,
             )
-            source_for_diarization_osd = bandit_vocals_file
+            source_for_diarization_osd = audio_separator_vocals_file
             log.info(
-                f"Using Bandit-v2 output '{bandit_vocals_file.name}' for subsequent diarization and OSD."
+                f"Using Audio Separator output '{audio_separator_vocals_file.name}' for subsequent diarization and OSD."
             )
         else:
             log.warning(
-                "Bandit-v2 vocal separation failed or produced no output. Using original audio for downstream tasks."
+                "Audio Separator vocal separation failed or produced no output. Using original audio for downstream tasks."
             )
+            
+        # Save instrumental visualization if available
+        if audio_separator_instrumental_file and audio_separator_instrumental_file.exists():
+            save_detailed_spectrograms(
+                audio_separator_instrumental_file,
+                visualizations_output_dir,
+                "02b_AudioSeparator_Instrumental_Only",
+                target_name_str,
+            )
+            log.info(f"Audio Separator also created instrumental: '{audio_separator_instrumental_file.name}'")
     else:
         if args.classify_and_clean:
             log.info(
-                "[bold yellow]Skipping initial Bandit-v2 run because --classify-and-clean is active. Bandit will be used later on noisy segments only.[/]"
+                "[bold yellow]Skipping initial Audio Separator run because --classify-and-clean is active. Audio Separator will be used later on noisy segments only.[/]"
             )
         else:
             log.info(
-                f"Skipping Bandit-v2. Using original input '{input_audio_p.name}' for diarization and OSD."
+                f"Skipping Audio Separator. Using original input '{input_audio_p.name}' for diarization and OSD."
             )
     # --- STAGE 3: Speaker Diarization (PyAnnote 3.1) ---
     log.info("[bold magenta]== STAGE 3: Speaker Diarization ==[/]")
@@ -621,16 +656,15 @@ def main(args):
     )  # --- STAGE 6: Slice & Verify Target's SOLO Segments ---
     if args.classify_and_clean:
         log.info(
-            f"[bold magenta]== STAGE 6: Slice & Verify '{target_name_str}' SOLO Segments (Classify & Clean) ==[/]"
-        )
+            f"[bold magenta]== STAGE 6: Slice & Verify '{target_name_str}' SOLO Segments (Classify & Clean) ==[/]"        )
         log.info(
             "Using classify-and-clean logic: slice from original -> classify noise -> clean noisy -> verify all"
-        )    
+        )
     else:
         log.info(
             f"[bold magenta]== STAGE 6: Slice & Verify '{target_name_str}' SOLO Segments (Standard) ==[/]"
         )
-        log.info("Using standard logic: slice from Bandit output -> verify segments")
+        log.info("Using standard logic: slice from Audio Separator output -> verify segments")
 
     verified_solo_paths, all_segment_details = slice_classify_clean_and_verify_target_solo_segments(
         diarization_result=diarization_annotation,
@@ -648,9 +682,8 @@ def main(args):
         verification_threshold=args.verification_threshold,        vad_verification=True,
         transcribe_verified_segments=False,  # Transcription now happens in Stage 7 only
         classify_and_clean=args.classify_and_clean,
-        noise_classifier_model_id="Etherll/NoisySpeechDetection-v0.2",
-        bandit_model_checkpoint=bandit_separator_model if not args.skip_bandit else None,
-        bandit_vocals_file=bandit_vocals_file,
+        noise_classifier_model_id="Etherll/NoisySpeechDetection-v0.2",        audio_separator_model=audio_separator_model if not args.skip_audio_separator else None,
+        vocals_file=audio_separator_vocals_file,
         noise_classification_confidence_threshold=args.noise_threshold,
         skip_verification_if_cleaned=False,
         whisper_model_instance=whisper_asr_model,
@@ -664,37 +697,39 @@ def main(args):
         if not segment_detail.get("verified", False) and segment_detail.get("output_file_path"):
             rejected_path = Path(segment_detail["output_file_path"])
             if rejected_path.exists():
-                rejected_solo_paths.append(rejected_path)
-
-    # --- STAGE 7: Transcribe Segments (Whisper) ---
+                rejected_solo_paths.append(rejected_path)    # --- STAGE 7: Transcribe Segments (ASR) ---
     if verified_solo_paths:
         log.info(
-            f"[bold magenta]== STAGE 7a: Transcribing VERIFIED SOLO Segments ('{target_name_str}') ==[/]"
-        )        
+            f"[bold magenta]== STAGE 7a: Transcribing VERIFIED SOLO Segments ('{target_name_str}') with {args.asr_engine.upper()} ==[/]"
+        )
         transcripts = transcribe_segments(
             segment_paths=verified_solo_paths,
             output_dir=transcripts_verified_dir,
             target_name=target_name_str,
             segment_label="solo_verified",
-            whisper_model_name=args.whisper_model,
+            model_name=args.whisper_model if args.asr_engine == "whisper" else args.nemo_asr_model,
+            asr_engine=args.asr_engine,
             language=args.language,
             whisper_model_instance=whisper_asr_model,
+            nemo_model_instance=nemo_asr_model,
         )
     else:
         log.info(f"No verified solo segments of '{target_name_str}' to transcribe.")
 
     if not args.skip_rejected_transcripts and rejected_solo_paths:
         log.info(
-            f"[bold magenta]== STAGE 7b: Transcribing REJECTED SOLO Segments ('{target_name_str}') ==[/]"
-        )      
+            f"[bold magenta]== STAGE 7b: Transcribing REJECTED SOLO Segments ('{target_name_str}') with {args.asr_engine.upper()} ==[/]"
+        )
         transcripts = transcribe_segments(
             segment_paths=rejected_solo_paths,
             output_dir=transcripts_rejected_dir,
             target_name=target_name_str,
             segment_label="solo_rejected_for_review",
-            whisper_model_name=args.whisper_model,
+            model_name=args.whisper_model if args.asr_engine == "whisper" else args.nemo_asr_model,
+            asr_engine=args.asr_engine,
             language=args.language,
             whisper_model_instance=whisper_asr_model,
+            nemo_model_instance=nemo_asr_model,
         )
     else:
         log.info(
@@ -735,10 +770,11 @@ def main(args):
     comparison_files_list = [(input_audio_p, "Original Input")]
     overlap_timeline_for_plots = {
         str(source_for_diarization_osd.resolve()): overlap_timeline
-    }
-
-    if bandit_vocals_file and bandit_vocals_file.exists():
-        comparison_files_list.append((bandit_vocals_file, "Bandit-v2 Vocals"))
+    }    
+    if audio_separator_vocals_file and audio_separator_vocals_file.exists():
+        comparison_files_list.append((audio_separator_vocals_file, "Audio Separator Vocals"))
+    if audio_separator_instrumental_file and audio_separator_instrumental_file.exists():
+        comparison_files_list.append((audio_separator_instrumental_file, "Audio Separator Instrumental"))
     if concatenated_solo_verified_file and concatenated_solo_verified_file.exists():
         comparison_files_list.append(
             (
@@ -867,10 +903,10 @@ if __name__ == "__main__":
                     )
                 except Exception:
                     pass
-        log.debug(f"Bandit-v2 available via import: {HAVE_BANDIT_V2}")
+        log.debug(f"Audio Separator available via import: {HAVE_AUDIO_SEPARATOR}")
         log.debug(f"WeSpeaker available via import: {HAVE_WESPEAKER}")
         log.debug(f"SpeechBrain available via import: {HAVE_SPEECHBRAIN}")
-        log.debug(f"Bandit-v2 repo path (from arg or env): {args.bandit_repo_path}")
+        log.debug(f"NeMo ASR available via import: {HAVE_NEMO_ASR}")
 
     # HuggingFace token handling
     if not args.token:

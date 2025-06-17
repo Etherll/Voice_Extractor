@@ -34,6 +34,7 @@ REQ = [
     "torch>=2.5.0", "torchaudio>=2.5.0", "torchvision>=0.20.0",  # Changed from >=2.7.0
     "pyannote.audio>=3.3.2",
     "openai-whisper>=20240930",
+    "nemo_toolkit[asr]",  # Nvidia Parakeet TDT ASR support
     "matplotlib", "librosa",
     "speechbrain>=1.0.0",
     "torchcrepe>=0.0.21",
@@ -46,18 +47,9 @@ REQ = [
     "onnx",
     "onnxruntime",
     "fairseq==0.12.2 --no-deps",
-    # Bandit-v2 dependencies
-    "ray>=2.10.0,<2.20",
-    "pandas",  # Required by ray.train
-    "tensorboard",  # Required by ray.train
-    "tensorboardX",  # Sometimes needed by ray.train
     "transformers",
-    "einops>=0.6.0",
-    "asteroid>=0.5.0",
-    "asteroid-filterbanks>=0.4.0",
-    "julius>=0.2.7",
-    "torch-audiomentations>=0.11.0",
-    "omegaconf>=2.3.0"
+    "audio_separator[gpu]"
+
 ]
 
 # Model configurations - will be conditionally downloaded
