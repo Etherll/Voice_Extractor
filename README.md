@@ -27,7 +27,7 @@ A comprehensive AI-powered tool for identifying, isolating, and transcribing cle
 
 ## Min Specs:
 
-NVIDIA GPU with 16GB VRAM
+NVIDIA GPU with 6GB VRAM
 
 ## Installation
 
