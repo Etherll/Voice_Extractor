@@ -211,6 +211,7 @@ tune_group.add_argument(
     help="Maximum segment duration (seconds) before intelligent chunking is used. Set to a large value (e.g., 99999) to disable chunking entirely.",
 )
 
+
 # Debugging and Miscellaneous
 debug_group = parser.add_argument_group("Debugging and Miscellaneous")
 debug_group.add_argument(
@@ -337,6 +338,8 @@ try:      from audio_pipeline import (
         identify_target_speaker,
         init_speechbrain_speaker_recognition_model,        slice_classify_clean_and_verify_target_solo_segments,
         transcribe_segments,
+        classify_segments_for_noise,
+        run_bandit_on_noisy_segments,
         concatenate_segments,
         HAVE_AUDIO_SEPARATOR,
         HAVE_WESPEAKER,
@@ -351,7 +354,6 @@ except ImportError as e_pipeline_import:
         "or issues with required dependencies."
     )
     sys.exit(1)
-
 
 def main(args):
     """Main orchestrator function for the voice extraction pipeline."""
@@ -380,6 +382,7 @@ def main(args):
         )
         sys.exit(1)
     if not target_name_str.strip():
+
         log.error("[bold red]Target name cannot be empty. Exiting.[/]")
         sys.exit(1)    # Check if critical toolkits are available based on imports and args    if (not args.skip_audio_separator or args.classify_and_clean) and not HAVE_AUDIO_SEPARATOR:
         log.error(
@@ -391,6 +394,7 @@ def main(args):
             "[bold red]NeMo ASR is requested but not available. Please install with: pip install nemo_toolkit[asr][/]"
         )
         sys.exit(1)
+
     if not HAVE_WESPEAKER:
         log.error(
             "[bold red]WeSpeaker library not loaded. This is critical for speaker ID/Verification. Check installation. Exiting.[/]"
@@ -429,6 +433,7 @@ def main(args):
         f"Reference audio for '{target_name_str}': [bold cyan]{reference_audio_p.name}[/]"
     )
     log.info(f"Run output directory: [bold cyan]{output_dir.resolve()}[/]")
+
     if args.dry_run:
         log.warning("[DRY-RUN MODE ENABLED] Processing will be limited.")
 
@@ -445,6 +450,7 @@ def main(args):
                 "[bold red]Failed to initialize Audio Separator model, which is required for this workflow. Exiting.[/]"
             )
             sys.exit(1)
+
     if not args.wespeaker_rvector_model or not args.wespeaker_gemini_model:
         log.error(
             "[bold red]--wespeaker-rvector-model and --wespeaker-gemini-model are required. Exiting.[/]"
@@ -533,6 +539,7 @@ def main(args):
     
     # --- STAGE 2: Vocal Separation (Audio Separator Mel-Roformer) ---
     source_for_diarization_osd = input_audio_p
+
     audio_separator_vocals_file = None
     audio_separator_instrumental_file = None
     if not args.skip_audio_separator and not args.classify_and_clean and audio_separator_model:
@@ -552,6 +559,7 @@ def main(args):
             log.info(
                 f"Using Audio Separator output '{audio_separator_vocals_file.name}' for subsequent diarization and OSD."
             )
+
         else:
             log.warning(
                 "Audio Separator vocal separation failed or produced no output. Using original audio for downstream tasks."
@@ -575,6 +583,7 @@ def main(args):
             log.info(
                 f"Skipping Audio Separator. Using original input '{input_audio_p.name}' for diarization and OSD."
             )
+
     # --- STAGE 3: Speaker Diarization (PyAnnote 3.1) ---
     log.info("[bold magenta]== STAGE 3: Speaker Diarization ==[/]")
     diar_model_config = {"diar_model": args.diar_model, "diar_hyperparams": {}}
@@ -647,6 +656,7 @@ def main(args):
         plot_title_prefix=f"03_Diarization_OSD_{safe_filename(target_name_str)}",
         overlap_timeline=overlap_timeline,
     )
+
     save_detailed_spectrograms(
         source_for_diarization_osd,
         visualizations_output_dir,
@@ -698,6 +708,48 @@ def main(args):
             rejected_path = Path(segment_detail["output_file_path"])
             if rejected_path.exists():
                 rejected_solo_paths.append(rejected_path)    # --- STAGE 7: Transcribe Segments (ASR) ---
+=======
+    
+    # --- NEW STAGE 6.5: Classify, Separate, and Re-process Noisy Segments ---
+    if args.classify_and_clean and verified_solo_paths:
+        log.info(f"[bold magenta]== STAGE 6.5: Classifying and Cleaning Noisy Segments ==[/]")
+        
+        # 1. Classify segments
+        initially_clean_paths, noisy_paths_to_clean = classify_segments_for_noise(
+            verified_solo_paths, args.noise_threshold
+        )
+        
+        # 2. Re-organize files into new subdirectories for clarity
+        clean_verified_dir = segments_base_output_dir / "clean_verified"
+        noisy_originals_dir = segments_base_output_dir / "noisy_originals_for_cleaning"
+        cleaned_by_bandit_dir = segments_base_output_dir / "noisy_cleaned_by_bandit"
+        ensure_dir_exists(clean_verified_dir)
+        ensure_dir_exists(noisy_originals_dir)
+        ensure_dir_exists(cleaned_by_bandit_dir)
+
+        # Move files and update path lists
+        final_clean_paths = []
+        for p in initially_clean_paths:
+            dest = clean_verified_dir / p.name
+            shutil.move(str(p), str(dest))
+            final_clean_paths.append(dest)
+        
+        moved_noisy_paths = []
+        for p in noisy_paths_to_clean:
+            dest = noisy_originals_dir / p.name
+            shutil.move(str(p), str(dest))
+            moved_noisy_paths.append(dest)
+        
+        # 3. Run Bandit on the noisy segments
+        newly_cleaned_paths = run_bandit_on_noisy_segments(
+            moved_noisy_paths, bandit_separator_model, cleaned_by_bandit_dir, run_tmp_dir
+        )
+
+        # 4. Update the final list of verified paths for downstream tasks
+        verified_solo_paths = final_clean_paths + newly_cleaned_paths
+        log.info(f"Final dataset for transcription/concatenation consists of {len(final_clean_paths)} initially clean + {len(newly_cleaned_paths)} newly cleaned segments.")
+    
+    # --- STAGE 7: Transcribe Segments (Whisper) ---
     if verified_solo_paths:
         log.info(
             f"[bold magenta]== STAGE 7a: Transcribing VERIFIED SOLO Segments ('{target_name_str}') with {args.asr_engine.upper()} ==[/]"

@@ -95,6 +95,7 @@ from common import (
     format_duration,
 )
 
+
 # --- Model Initialization Functions ---
 def init_audio_separator(model_filename: str = 'model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt'):
     """
@@ -2300,6 +2301,149 @@ def concatenate_segments(
 
 
 
+def classify_segments_for_noise(
+    segment_paths: list[Path],
+    noise_threshold: float = 0.7
+) -> tuple[list[Path], list[Path]]:
+    """
+    Classifies audio segments as 'clean' or 'noisy' using a transformer model.
+    """
+    if not HAVE_TRANSFORMERS:
+        log.error("Transformers library not found. Cannot perform noise classification.")
+        return segment_paths, [] # Assume all are clean if library is missing
+
+    if not segment_paths:
+        return [], []
+
+    log.info(f"Classifying {len(segment_paths)} segments for noise with model 'Etherll/NoisySpeechDetection-v0.2'...")
+    
+    try:
+        classifier = transformers_pipeline(
+            "audio-classification", 
+            model="Etherll/NoisySpeechDetection-v0.2",
+            device=DEVICE
+        )
+    except Exception as e:
+        log.error(f"Failed to load NoisySpeechDetection model: {e}. Aborting classification.")
+        return segment_paths, []
+
+    clean_segments = []
+    noisy_segments = []
+
+    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
+        task = pb.add_task("Classifying noise...", total=len(segment_paths))
+        for segment_path in segment_paths:
+            try:
+                results = classifier(str(segment_path))
+                # Find the score for the 'clean' label
+                clean_score = next((item['score'] for item in results if item['label'] == 'clean'), 0.0)
+                
+                if clean_score >= noise_threshold:
+                    clean_segments.append(segment_path)
+                    log.debug(f"Segment '{segment_path.name}' classified as CLEAN (score: {clean_score:.3f})")
+                else:
+                    noisy_segments.append(segment_path)
+                    log.debug(f"Segment '{segment_path.name}' classified as NOISY (clean_score: {clean_score:.3f})")
+
+            except Exception as e:
+                log.warning(f"Could not classify segment {segment_path.name}: {e}. Assuming it's clean.")
+                clean_segments.append(segment_path)
+            
+            pb.update(task, advance=1)
+
+    log.info(f"Classification complete. Found {len(clean_segments)} clean segments and {len(noisy_segments)} noisy segments.")
+    return clean_segments, noisy_segments
+
+
+def run_bandit_on_noisy_segments(
+    noisy_paths: list[Path], 
+    bandit_separator_model: Path, 
+    output_dir_cleaned: Path,
+    tmp_dir: Path
+) -> list[Path]:
+    """
+    Runs Bandit-v2 vocal separation on a list of (small) noisy audio files.
+    """
+    if not noisy_paths:
+        log.info("No noisy segments to process with Bandit-v2.")
+        return []
+
+    if not bandit_separator_model or not bandit_separator_model.exists():
+        log.error("Bandit-v2 model not available. Cannot clean noisy segments.")
+        return []
+    
+    ensure_dir_exists(output_dir_cleaned)
+    log.info(f"Running Bandit-v2 on {len(noisy_paths)} noisy segments...")
+
+    cleaned_segment_paths = []
+    
+    bandit_repo_path = Path(os.environ.get('BANDIT_REPO_PATH', 'repos/bandit-v2')).resolve()
+    original_config_path = bandit_repo_path / "expt" / "inference.yaml"
+    temp_config_path = bandit_repo_path / "expt" / "inference_temp_segment_cleaner.yaml"
+
+    try:
+        # Use the same approach as the main vocal separation function
+        with open(original_config_path, 'r', encoding='utf-8') as f:
+            config_content = f.read()
+        
+        repo_path_url = bandit_repo_path.as_posix()
+        config_content = config_content.replace('$REPO_ROOT', repo_path_url)
+        config_content = config_content.replace('data: dnr-v3-com-smad-multi-v2', 'data: dnr-v3-com-smad-multi-v2b')
+        
+        import re
+        config_content = re.sub(r'file://([^"\']+)', lambda m: 'file://' + m.group(1).replace('\\', '/'), config_content)
+        
+        with open(temp_config_path, 'w', encoding='utf-8') as f:
+            f.write(config_content)
+        
+        with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
+            task = pb.add_task("Cleaning noisy segments...", total=len(noisy_paths))
+            for noisy_file in noisy_paths:
+                segment_temp_output = tmp_dir / f"bandit_out_{noisy_file.stem}"
+                ensure_dir_exists(segment_temp_output)
+                cleaned_output_path = output_dir_cleaned / f"{noisy_file.stem}_cleaned.wav"
+                
+                cmd = [
+                    sys.executable, "inference.py",
+                    "--config-name", temp_config_path.stem,
+                    f"ckpt_path={bandit_separator_model.resolve()}",
+                    f"+test_audio={noisy_file.resolve()}",
+                    f"+output_path={segment_temp_output.resolve()}",
+                    f"+model_variant=speech"
+                ]
+                
+                env = os.environ.copy()
+                env["REPO_ROOT"] = str(bandit_repo_path)
+                env["HYDRA_FULL_ERROR"] = "1"
+                if DEVICE.type == "cuda":
+                    env["CUDA_VISIBLE_DEVICES"] = "0"
+
+                result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(bandit_repo_path))
+
+                if result.returncode == 0:
+                    expected_output = segment_temp_output / "speech_estimate.wav"
+                    if expected_output.exists():
+                        shutil.move(str(expected_output), str(cleaned_output_path))
+                        cleaned_segment_paths.append(cleaned_output_path)
+                        log.debug(f"Successfully cleaned '{noisy_file.name}' -> '{cleaned_output_path.name}'")
+                    else:
+                        log.warning(f"Bandit ran for '{noisy_file.name}' but output 'speech_estimate.wav' not found.")
+                else:
+                    log.error(f"Bandit failed for segment '{noisy_file.name}'.")
+                    log.error("--- BANDIT STDERR ---")
+                    console.print(result.stderr)
+                    log.error("--- BANDIT STDOUT ---")
+                    console.print(result.stdout)
+                    log.error("--- END BANDIT OUTPUT ---")
+
+                shutil.rmtree(segment_temp_output, ignore_errors=True)
+                pb.update(task, advance=1)
+    finally:
+        if temp_config_path.exists():
+            temp_config_path.unlink()
+
+    log.info(f"Bandit-v2 processing complete. Successfully cleaned {len(cleaned_segment_paths)} segments.")
+    return cleaned_segment_paths
 
 def run_audio_separator_on_noisy_segments(
     noisy_paths: list[Path], 
