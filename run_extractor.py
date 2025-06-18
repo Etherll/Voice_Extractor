@@ -707,48 +707,9 @@ def main(args):
         if not segment_detail.get("verified", False) and segment_detail.get("output_file_path"):
             rejected_path = Path(segment_detail["output_file_path"])
             if rejected_path.exists():
-                rejected_solo_paths.append(rejected_path)    # --- STAGE 7: Transcribe Segments (ASR) ---
-=======
+                rejected_solo_paths.append(rejected_path) 
     
-    # --- NEW STAGE 6.5: Classify, Separate, and Re-process Noisy Segments ---
-    if args.classify_and_clean and verified_solo_paths:
-        log.info(f"[bold magenta]== STAGE 6.5: Classifying and Cleaning Noisy Segments ==[/]")
-        
-        # 1. Classify segments
-        initially_clean_paths, noisy_paths_to_clean = classify_segments_for_noise(
-            verified_solo_paths, args.noise_threshold
-        )
-        
-        # 2. Re-organize files into new subdirectories for clarity
-        clean_verified_dir = segments_base_output_dir / "clean_verified"
-        noisy_originals_dir = segments_base_output_dir / "noisy_originals_for_cleaning"
-        cleaned_by_bandit_dir = segments_base_output_dir / "noisy_cleaned_by_bandit"
-        ensure_dir_exists(clean_verified_dir)
-        ensure_dir_exists(noisy_originals_dir)
-        ensure_dir_exists(cleaned_by_bandit_dir)
-
-        # Move files and update path lists
-        final_clean_paths = []
-        for p in initially_clean_paths:
-            dest = clean_verified_dir / p.name
-            shutil.move(str(p), str(dest))
-            final_clean_paths.append(dest)
-        
-        moved_noisy_paths = []
-        for p in noisy_paths_to_clean:
-            dest = noisy_originals_dir / p.name
-            shutil.move(str(p), str(dest))
-            moved_noisy_paths.append(dest)
-        
-        # 3. Run Bandit on the noisy segments
-        newly_cleaned_paths = run_bandit_on_noisy_segments(
-            moved_noisy_paths, bandit_separator_model, cleaned_by_bandit_dir, run_tmp_dir
-        )
-
-        # 4. Update the final list of verified paths for downstream tasks
-        verified_solo_paths = final_clean_paths + newly_cleaned_paths
-        log.info(f"Final dataset for transcription/concatenation consists of {len(final_clean_paths)} initially clean + {len(newly_cleaned_paths)} newly cleaned segments.")
-    
+ 
     # --- STAGE 7: Transcribe Segments (Whisper) ---
     if verified_solo_paths:
         log.info(
