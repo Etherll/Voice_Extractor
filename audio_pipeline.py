@@ -10,29 +10,47 @@ verification, transcription, and concatenation.
 from __future__ import annotations
 import sys
 from pathlib import Path
-import numpy as np
 import shutil
 import time
-import csv
 import subprocess
 import os
 import re
 import tempfile
 
-os.environ['SPEECHBRAIN_FETCH_LOCAL_STRATEGY'] = 'copy' # For SpeechBrain on Windows
+os.environ["SPEECHBRAIN_FETCH_LOCAL_STRATEGY"] = "copy"  # For SpeechBrain on Windows
 
 import torch
-import soundfile as sf
+import torchaudio as ta
 import librosa
 from pyannote.audio import Pipeline as PyannotePipeline
 from pyannote.audio import Model as PyannoteModel
 from pyannote.audio.pipelines import OverlappedSpeechDetection as PyannoteOSDPipeline
 from pyannote.core import Segment, Timeline, Annotation
 import whisper
+import ffmpeg
+from pydub import AudioSegment
+from rich.progress import (
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    SpinnerColumn,
+)
+from rich.table import Table
+
+try:
+    from transformers import pipeline as transformers_pipeline
+    HAVE_TRANSFORMERS = True
+except ImportError:
+    HAVE_TRANSFORMERS = False
 
 
-# Bandit-v2 (Vocal Separation)
-HAVE_BANDIT_V2 = os.path.exists(os.environ.get('BANDIT_REPO_PATH', 'repos/bandit-v2'))
+# Audio Separator (Vocal Separation)
+try:
+    from audio_separator.separator import Separator
+    HAVE_AUDIO_SEPARATOR = True
+except ImportError:
+    HAVE_AUDIO_SEPARATOR = False
+    Separator = None
 
 
 # WeSpeaker (Speaker Embedding)
@@ -43,9 +61,20 @@ except ImportError:
     HAVE_WESPEAKER = False
     wespeaker = None
 
+# NeMo ASR (Nvidia Parakeet TDT)
+try:
+    import nemo.collections.asr as nemo_asr
+    HAVE_NEMO_ASR = True
+except ImportError:
+    HAVE_NEMO_ASR = False
+    nemo_asr = None
+
 # SpeechBrain (Speaker Verification - ECAPA-TDNN)
 try:
-    from speechbrain.inference.speaker import SpeakerRecognition as SpeechBrainSpeakerRecognition
+    from speechbrain.inference.speaker import (
+        SpeakerRecognition as SpeechBrainSpeakerRecognition,
+    )
+
     HAVE_SPEECHBRAIN = True
 except ImportError:
     HAVE_SPEECHBRAIN = False
@@ -53,523 +82,749 @@ except ImportError:
 
 
 from common import (
-    log, console, DEVICE,
-    ff_trim, ff_slice, cos, to_mono,
-    plot_verification_scores,
-    DEFAULT_MIN_SEGMENT_SEC, DEFAULT_MAX_MERGE_GAP,
-    ensure_dir_exists, safe_filename, format_duration
+    log,
+    console,
+    DEVICE,
+    ff_trim,
+    ff_slice_smart,
+    cos,
+    DEFAULT_MIN_SEGMENT_SEC,
+    DEFAULT_MAX_MERGE_GAP,
+    ensure_dir_exists,
+    safe_filename,
+    format_duration,
 )
-import ffmpeg
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, SpinnerColumn
-from rich.table import Table
 
-try:
-    from transformers import pipeline as transformers_pipeline
-    HAVE_TRANSFORMERS = True
-except ImportError:
-    HAVE_TRANSFORMERS = False
-    
-import yaml
 
 # --- Model Initialization Functions ---
-def init_bandit_separator(model_checkpoint_path: Path) -> Path | None:
-    """Returns the path to the Bandit-v2 checkpoint if valid."""
-    if not model_checkpoint_path.exists():
-        log.error(f"Bandit-v2 model checkpoint not found at: {model_checkpoint_path}")
-        return None
+def init_audio_separator(model_filename: str = 'model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt'):
+    """
+    Initializes and returns the Audio Separator with Mel-Roformer model.
     
-    # Verify that the inference script exists
-    bandit_repo_path = Path(os.environ.get('BANDIT_REPO_PATH', 'repos/bandit-v2'))
-    inference_script = bandit_repo_path / "inference.py"
+    Args:
+        model_filename: Name of the Mel-Roformer model file to load
     
-    if not inference_script.exists():
-        log.error(f"Bandit-v2 inference.py not found at: {inference_script}")
-        return None
-    
-    log.info(f"[green]✓ Bandit-v2 checkpoint found: {model_checkpoint_path.name}[/]")
-    return model_checkpoint_path
+    Returns:
+        Initialized Separator instance, or None if initialization failed
+    """
+    # Set up logging fallback
+    try:
+        logger = log
+    except (NameError, AttributeError):
+        import logging
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        logger = logging.getLogger(__name__)
 
+    if not HAVE_AUDIO_SEPARATOR:
+        logger.error("Audio Separator library is not available. Please install with: pip install audio-separator")
+        return None
 
-def init_wespeaker_models(rvector_id_or_path: str, gemini_id_or_path: str) -> dict | None:
+    logger.info(f"Initializing Audio Separator with model: {model_filename}")
+
+    try:
+        # Initialize the Separator
+        separator = Separator()
+        
+        # Load the Mel-Roformer model
+        separator.load_model(model_filename=model_filename)
+        
+        logger.info(f"✓ Audio Separator initialized successfully with {model_filename}")
+        return separator
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize Audio Separator: {e}")
+        return None
+def init_wespeaker_models(
+    rvector_id_or_path: str, gemini_id_or_path: str
+) -> dict | None:
     """Initializes WeSpeaker models (Deep r-vector and speaker verification)."""
     if not HAVE_WESPEAKER:
         log.error("WeSpeaker library not found. Please ensure it's installed.")
         return None
-    
+
     models = {"rvector": None, "gemini": None}
-    
+
     # For automatic model downloading, WeSpeaker uses 'english' or 'chinese'
     # 'english': ResNet221_LM pretrained on VoxCeleb
     # 'chinese': ResNet34_LM pretrained on CnCeleb
     model_configs = {
         "rvector": {"id_or_path": rvector_id_or_path, "desc": "Deep r-vector"},
-        "gemini": {"id_or_path": gemini_id_or_path, "desc": "speaker verification"}
+        "gemini": {"id_or_path": gemini_id_or_path, "desc": "speaker verification"},
     }
 
     for model_key, config in model_configs.items():
         model_id_or_path = config["id_or_path"]
         model_desc = config["desc"]
         log.info(f"Initializing WeSpeaker {model_desc} model: {model_id_or_path}")
-        
+
         try:
             # Check if it's a local path with the required files
             local_path = Path(model_id_or_path)
-            if local_path.is_dir() and (local_path / "avg_model.pt").exists() and (local_path / "config.yaml").exists():
-                log.info(f"Loading WeSpeaker {model_desc} from local path: {model_id_or_path}")
+            if (
+                local_path.is_dir()
+                and (local_path / "avg_model.pt").exists()
+                and (local_path / "config.yaml").exists()
+            ):
+                log.info(
+                    f"Loading WeSpeaker {model_desc} from local path: {model_id_or_path}"
+                )
                 model = wespeaker.load_model_local(str(local_path))
             else:
                 # Use the standard load_model function which handles automatic downloading
-                log.info(f"Loading WeSpeaker {model_desc} model (auto-download if needed): {model_id_or_path}")
-                
+                log.info(
+                    f"Loading WeSpeaker {model_desc} model (auto-download if needed): {model_id_or_path}"
+                )
+
                 # WeSpeaker accepts 'english' or 'chinese' as model identifiers
-                if model_id_or_path.lower() not in ['english', 'chinese']:
-                    log.warning(f"Unknown model identifier '{model_id_or_path}', defaulting to 'english'")
-                    model_id = 'english'
+                if model_id_or_path.lower() not in ["english", "chinese"]:
+                    log.warning(
+                        f"Unknown model identifier '{model_id_or_path}', defaulting to 'english'"
+                    )
+                    model_id = "english"
                 else:
                     model_id = model_id_or_path.lower()
-                
+
                 # Download with retry logic for reliability
                 model = None
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        log.info(f"Downloading WeSpeaker '{model_id}' model (attempt {attempt + 1}/{max_retries})...")
+                        log.info(
+                            f"Downloading WeSpeaker '{model_id}' model (attempt {attempt + 1}/{max_retries})..."
+                        )
                         model = wespeaker.load_model(model_id)
-                        log.info(f"[green]✓ Successfully loaded WeSpeaker '{model_id}' model[/]")
+                        log.info(
+                            f"[green]✓ Successfully loaded WeSpeaker '{model_id}' model[/]"
+                        )
                         break
                     except Exception as e:
                         if attempt < max_retries - 1:
                             wait_time = (attempt + 1) * 5  # Progressive backoff
-                            log.warning(f"Download failed: {e}. Retrying in {wait_time} seconds...")
+                            log.warning(
+                                f"Download failed: {e}. Retrying in {wait_time} seconds..."
+                            )
                             time.sleep(wait_time)
                         else:
-                            log.error(f"Failed to download WeSpeaker '{model_id}' model after {max_retries} attempts: {e}")
+                            log.error(
+                                f"Failed to download WeSpeaker '{model_id}' model after {max_retries} attempts: {e}"
+                            )
                             raise
-                
+
                 if model is None:
                     raise RuntimeError(f"Failed to load WeSpeaker model '{model_id}'")
-            
+
             model.set_device(DEVICE.type)
             models[model_key] = model
-            log.info(f"[green]✓ WeSpeaker {model_desc} model loaded to {DEVICE.type.upper()}.[/]")
-            
+            log.info(
+                f"[green]✓ WeSpeaker {model_desc} model loaded to {DEVICE.type.upper()}.[/]"
+            )
+
         except Exception as e:
             log.error(f"Failed to load WeSpeaker {model_desc} model: {e}")
             log.error("This may be due to network issues during model download.")
             log.error("Please check your internet connection and try again.")
             # For essential models, we should fail here
-            if model_key == "rvector":  # r-vector is critical for speaker identification
+            if (
+                model_key == "rvector"
+            ):  # r-vector is critical for speaker identification
                 return None
-    
+
     # If at least the critical r-vector model loaded, we can proceed
     if models["rvector"] is not None:
         if models["gemini"] is None:
-            log.warning("Gemini model failed to load. Speaker verification may be less accurate.")
+            log.warning(
+                "Gemini model failed to load. Speaker verification may be less accurate."
+            )
             # Both models should use the same one for consistency
             models["gemini"] = models["rvector"]
         return models
     else:
         log.error("Critical r-vector model failed to initialize. Cannot proceed.")
         return None
-    
 
-def init_speechbrain_speaker_recognition_model(model_source: str = "speechbrain/spkrec-ecapa-voxceleb") -> 'SpeechBrainSpeakerRecognition' | None:
+
+def init_speechbrain_speaker_recognition_model(
+    model_source: str = "speechbrain/spkrec-ecapa-voxceleb",
+):
     """Initializes the SpeechBrain SpeakerRecognition model (ECAPA-TDNN)."""
     if not HAVE_SPEECHBRAIN:
-        log.warning("SpeechBrain library not found or import failed. SpeechBrain ECAPA-TDNN verification will be skipped.")
-        return None
-    
-    log.info(f"Initializing SpeechBrain SpeakerRecognition model: {model_source}")
-    if os.name == 'nt' and os.getenv('SPEECHBRAIN_FETCH_LOCAL_STRATEGY') != 'copy':
-        log.warning("SPEECHBRAIN_FETCH_LOCAL_STRATEGY is not 'copy'. This may cause issues on Windows with symlinks. "
-                    "Set environment variable SPEECHBRAIN_FETCH_LOCAL_STRATEGY=copy if errors occur.")
-    try:
-        if DEVICE.type == "cuda": torch.cuda.empty_cache()
-        user_cache_dir = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
-        # Ensure savedir is specific to avoid conflicts if multiple SpeechBrain models are used project-wide
-        savedir_name = model_source.replace("/", "_").replace("@", "_") # Sanitize name for directory
-        savedir = user_cache_dir / "voice_extractor_speechbrain_cache" / savedir_name
-        ensure_dir_exists(savedir)
-        
-        model = SpeechBrainSpeakerRecognition.from_hparams(
-            source=model_source, 
-            savedir=str(savedir), 
-            run_opts={"device": DEVICE.type}
+        log.warning(
+            "SpeechBrain library not found or import failed. SpeechBrain ECAPA-TDNN verification will be skipped."
         )
-        model.eval() # Set to evaluation mode
-        log.info(f"[green]✓ SpeechBrain model '{model_source}' loaded to {DEVICE.type.upper()}.[/]")
-        return model
-    except Exception as e:
-        log.error(f"Failed to load SpeechBrain SpeakerRecognition model '{model_source}': {e}")
         return None
 
+    log.info(f"Initializing SpeechBrain SpeakerRecognition model: {model_source}")
+    if os.name == "nt" and os.getenv("SPEECHBRAIN_FETCH_LOCAL_STRATEGY") != "copy":
+        log.warning(
+            "SPEECHBRAIN_FETCH_LOCAL_STRATEGY is not 'copy'. This may cause issues on Windows with symlinks. "
+            "Set environment variable SPEECHBRAIN_FETCH_LOCAL_STRATEGY=copy if errors occur."
+        )
+    try:
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
+        user_cache_dir = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
+        # Ensure savedir is specific to avoid conflicts if multiple SpeechBrain models are used project-wide
+        savedir_name = model_source.replace("/", "_").replace(
+            "@", "_"
+        )  # Sanitize name for directory
+        savedir = user_cache_dir / "voice_extractor_speechbrain_cache" / savedir_name
+        ensure_dir_exists(savedir)
+
+        model = SpeechBrainSpeakerRecognition.from_hparams(
+            source=model_source, savedir=str(savedir), run_opts={"device": DEVICE.type}
+        )
+        model.eval()  # Set to evaluation mode
+        log.info(
+            f"[green]✓ SpeechBrain model '{model_source}' loaded to {DEVICE.type.upper()}.[/]"
+        )
+        return model
+    except Exception as e:
+        log.error(
+            f"Failed to load SpeechBrain SpeakerRecognition model '{model_source}': {e}"
+        )
+        return None
+
+
+def init_nemo_asr_model(model_name: str = "nvidia/parakeet-tdt-0.6b-v2"):
+    """
+    Initializes and returns the NeMo ASR model (Parakeet TDT).
+    
+    Args:
+        model_name: Name of the NeMo ASR model to load
+    
+    Returns:
+        Initialized NeMo ASR model instance, or None if initialization failed
+    """
+    if not HAVE_NEMO_ASR:
+        log.error("NeMo ASR library is not available. Please install with: pip install nemo_toolkit[asr]")
+        return None
+
+    log.info(f"Initializing NeMo ASR model: {model_name}")
+
+    try:
+        # Load the ASR model
+        asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
+        
+        # Move to device if CUDA is available
+        if DEVICE.type == "cuda":
+            asr_model = asr_model.to(DEVICE)
+        
+        log.info(f"✓ NeMo ASR model '{model_name}' loaded successfully on {DEVICE.type.upper()}")
+        return asr_model
+        
+    except Exception as e:
+        log.error(f"Failed to initialize NeMo ASR model '{model_name}': {e}")
+        return None
+
+
+# --- Noise Classifier ---
+class NoiseClassifier:
+    """Classifies audio segments as 'clean' or 'noisy' using a Hugging Face transformer model."""
+
+    def __init__(
+        self, model_id: str = "speechbrain/urbansound8k_ecapa", device_to_use=DEVICE
+    ):
+        self.model_id = model_id
+        self.device = device_to_use
+        self.classifier = None  # Initialize classifier as None, load on demand
+        if not HAVE_TRANSFORMERS:
+            log.error(
+                "Transformers library not available. NoiseClassifier will not function."
+            )
+
+    def load_model(self):
+        """Loads the audio classification model into VRAM."""
+        if not HAVE_TRANSFORMERS:
+            log.debug(
+                "Transformers library not found, cannot load noise classification model."
+            )
+            return
+
+        if self.classifier is None:
+            log.info(
+                f"Loading noise classification model: {self.model_id} to {self.device.type}"
+            )
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()  # Free VRAM before loading
+            try:
+                self.classifier = transformers_pipeline(
+                    "audio-classification", model=self.model_id, device=self.device
+                )
+                log.info(f"[green]✓ Noise classifier '{self.model_id}' loaded.[/]")
+            except Exception as e:
+                log.error(f"Failed to load noise classifier '{self.model_id}': {e}")
+                self.classifier = None  # Ensure it's None on failure
+
+    def unload_model(self):
+        """Unloads the audio classification model from VRAM."""
+        if self.classifier is not None:
+            log.info(f"Unloading noise classification model: {self.model_id}")
+            del self.classifier
+            self.classifier = None
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            log.info(f"[green]✓ Noise classifier '{self.model_id}' unloaded.[/]")
+
+    def classify(self, audio_path: str, confidence_threshold: float = 0.3) -> str:
+        """
+        Classifies the audio file at audio_path.
+        Returns 'noisy', 'clean', or 'unknown'.
+        Assumes speechbrain/urbansound8k_ecapa or similar model where all output labels are non-speech sounds.
+        """
+        if not HAVE_TRANSFORMERS:
+            return "unknown"
+
+        self.load_model()  # Ensure model is loaded
+
+        if self.classifier is None:
+            log.error("Noise classifier model could not be loaded. Cannot classify.")
+            return "unknown"
+
+        try:
+            if not Path(audio_path).exists() or Path(audio_path).stat().st_size == 0:
+                log.error(
+                    f"Audio file for classification not found or empty: {audio_path}"
+                )
+                return "unknown"
+
+            result = self.classifier(audio_path)
+
+            if (
+                result
+                and isinstance(result, list)
+                and result[0]
+                and "score" in result[0]
+                and "label" in result[0]
+            ):
+                top_result = result[0]
+                log.debug(
+                    f"Noise classification for {Path(audio_path).name}: Top label '{top_result['label']}' (score: {top_result['score']:.2f})"
+                )
+                if top_result["score"] >= confidence_threshold:
+                    return "noisy"
+                else:
+                    return "clean"
+            else:
+                log.warning(
+                    f"Noise classification for {Path(audio_path).name} returned empty or unexpected result: {result}"
+                )
+                return "unknown"
+        except Exception as e:
+            log.error(
+                f"Error during noise classification for {Path(audio_path).name}: {e}"
+            )
+            return "unknown"
+
+
 # --- Pipeline Stages ---
+
 
 def prepare_reference_audio(
     reference_audio_path_arg: Path, tmp_dir: Path, target_name: str
 ) -> Path:
-    log.info(f"Preparing reference audio for '{target_name}' from: {reference_audio_path_arg.name}")
+    log.info(
+        f"Preparing reference audio for '{target_name}' from: {reference_audio_path_arg.name}"
+    )
     ensure_dir_exists(tmp_dir)
-    processed_ref_filename = f"{safe_filename(target_name)}_reference_processed_16k_mono.wav"
+    processed_ref_filename = (
+        f"{safe_filename(target_name)}_reference_processed_16k_mono.wav"
+    )
     processed_ref_path = tmp_dir / processed_ref_filename
     if not reference_audio_path_arg.exists():
-        raise FileNotFoundError(f"Reference audio file not found: {reference_audio_path_arg}")
+        raise FileNotFoundError(
+            f"Reference audio file not found: {reference_audio_path_arg}"
+        )
     try:
         # WeSpeaker and SpeechBrain typically expect 16kHz mono
-        ff_trim(reference_audio_path_arg, processed_ref_path, 0, 999999, target_sr=16000, target_ac=1)
+        ff_trim(
+            reference_audio_path_arg,
+            processed_ref_path,
+            0,
+            999999,
+            target_sr=16000,
+            target_ac=1,
+        )
         if not processed_ref_path.exists() or processed_ref_path.stat().st_size == 0:
-            raise RuntimeError("Processed reference audio file is empty or was not created.")
-        log.info(f"Processed reference audio (16kHz, mono) saved to: {processed_ref_path.name}")
+            raise RuntimeError(
+                "Processed reference audio file is empty or was not created."
+            )
+        log.info(
+            f"Processed reference audio (16kHz, mono) saved to: {processed_ref_path.name}"
+        )
         return processed_ref_path
     except Exception as e:
-        log.error(f"Failed to process reference audio '{reference_audio_path_arg.name}': {e}")
+        log.error(
+            f"Failed to process reference audio '{reference_audio_path_arg.name}': {e}"
+        )
         raise
 
-def run_bandit_vocal_separation(
-    input_audio_file: Path, 
-    bandit_separator: Path,  # Now it's clear this is the checkpoint path
-    output_dir: Path,
-    chunk_minutes: float = 5.0
-) -> Path | None:
-    """Performs vocal separation using Bandit-v2 via subprocess."""
-    
-    checkpoint_path = bandit_separator
-    
-    log.info(f"Starting vocal separation with Bandit-v2 for: {input_audio_file.name}")
-    ensure_dir_exists(output_dir)
-    
-    # Output filename for the vocals stem
-    vocals_output_filename = output_dir / f"{input_audio_file.stem}_vocals_bandit_v2.wav"
 
+def run_audio_separator_vocal_separation(
+    input_audio_file: Path,
+    audio_separator: object,
+    vocals_output_dir: Path,
+    instrumental_output_dir: Path = None,
+    chunk_minutes: float = 5.0,
+) -> tuple:
+    """Performs vocal separation using Audio Separator with Mel-Roformer model.
+    
+    Args:
+        input_audio_file: Path to the input audio file
+        audio_separator: Initialized Separator instance with loaded model
+        vocals_output_dir: Directory to store the separated vocals
+        instrumental_output_dir: Directory to store the separated instrumental (optional)
+        chunk_minutes: Unused parameter (kept for compatibility)
+    
+    Returns:
+        Tuple of (vocals_path, instrumental_path), either can be None if separation failed
+    """
+    if audio_separator is None:
+        log.error("Audio separator is not initialized")
+        return None, None
+
+    log.info(f"Starting vocal separation with Audio Separator (Mel-Roformer) for: {input_audio_file.name}")
+    ensure_dir_exists(vocals_output_dir)
+    if instrumental_output_dir:
+        ensure_dir_exists(instrumental_output_dir)
+
+    # Output filenames for the separated stems
+    vocals_output_filename = (
+        vocals_output_dir / f"{input_audio_file.stem}_vocals_bs_roformer.wav"
+    )
+    
+    instrumental_output_filename = None
+    if instrumental_output_dir:
+        instrumental_output_filename = (
+            instrumental_output_dir / f"{input_audio_file.stem}_instrumental_bs_roformer.wav"
+        )
+
+    # Check if vocals already exist
     if vocals_output_filename.exists() and vocals_output_filename.stat().st_size > 0:
-        log.info(f"Found existing Bandit-v2 vocals, skipping separation: {vocals_output_filename.name}")
-        return vocals_output_filename
+        log.info(
+            f"Found existing Audio Separator vocals, skipping separation: {vocals_output_filename.name}"
+        )
+        # Check for existing instrumental
+        existing_instrumental = None
+        if instrumental_output_filename and instrumental_output_filename.exists():
+            existing_instrumental = instrumental_output_filename
+        return vocals_output_filename, existing_instrumental
 
-    # Get Bandit-v2 paths
-    bandit_repo_path = Path(os.environ.get('BANDIT_REPO_PATH', 'repos/bandit-v2')).resolve()
-    inference_script = bandit_repo_path / "inference.py"
-    
-    if not inference_script.exists():
-        log.error(f"Bandit-v2 inference.py not found at: {inference_script}")
-        return None
-
-    # Fix config file
-    original_config_path = bandit_repo_path / "expt" / "inference.yaml"
-    temp_config_path = bandit_repo_path / "expt" / "inference_temp.yaml"
-    
     try:
-        with open(original_config_path, 'r', encoding='utf-8') as f:
-            config_content = f.read()
+        # Check input audio properties and implement padding if needed
+        log.info(f"Processing file: {input_audio_file}")
         
-        repo_path_url = bandit_repo_path.as_posix()
-        config_content = config_content.replace('$REPO_ROOT', repo_path_url)
-        config_content = config_content.replace('data: dnr-v3-com-smad-multi-v2', 'data: dnr-v3-com-smad-multi-v2b')
-        
-        import re
-        config_content = re.sub(r'file://([^"\']+)', lambda m: 'file://' + m.group(1).replace('\\', '/'), config_content)
-        
-        with open(temp_config_path, 'w', encoding='utf-8') as f:
-            f.write(config_content)
-
-        # Check audio duration and decide on processing strategy
+        # Load and check audio properties with librosa
         try:
-            import torchaudio
-            info = torchaudio.info(str(input_audio_file))
-            duration_seconds = info.num_frames / info.sample_rate
-            duration_minutes = duration_seconds / 60
-            sample_rate = info.sample_rate
-            num_channels = info.num_channels
+            import librosa
+            audio_data, sr = librosa.load(str(input_audio_file), sr=None)
+            log.info(f"Input audio: {len(audio_data)} samples, {sr}Hz, {audio_data.shape}")
+            audio_duration_seconds = len(audio_data) / sr
+        except Exception as load_err:
+            log.warning(f"Could not analyze input audio with librosa: {load_err}")
+            audio_duration_seconds = None
+        
+        # Implement padding logic for audio shorter than 8 seconds
+        MIN_AUDIO_DURATION = 8.0  # 8 seconds
+        PADDING_BUFFER = 0.05  # 50ms buffer
+        effective_min_duration = MIN_AUDIO_DURATION + PADDING_BUFFER
+        
+        processed_input_path = input_audio_file
+        temp_padded_file_path = None
+        original_duration_ms = None
+        padding_applied = False
+        
+        # Check if audio is shorter than minimum duration
+        if audio_duration_seconds is not None and audio_duration_seconds < effective_min_duration:
+            log.info(f"Audio duration {audio_duration_seconds:.2f}s is less than minimum {effective_min_duration:.2f}s. Applying padding...")
             
-            # Determine if chunking is needed based on duration
-            if duration_minutes > chunk_minutes:
-                log.info(f"Audio is {duration_minutes:.1f} minutes long. Processing in {chunk_minutes}-minute chunks...")
+            try:
+                # Load audio with pydub for padding
+                original_audio = AudioSegment.from_wav(str(input_audio_file))
+                original_duration_ms = len(original_audio)
                 
-                # Try progressively smaller chunks if memory issues occur
-                for attempt_chunk_minutes in [chunk_minutes, chunk_minutes/2, chunk_minutes/4]:
-                    log.info(f"Attempting with {attempt_chunk_minutes}-minute chunks...")
-                    
-                    result = _process_in_chunks(
-                        input_audio_file, checkpoint_path, output_dir, vocals_output_filename,
-                        bandit_repo_path, temp_config_path,
-                        duration_seconds, sample_rate, num_channels, attempt_chunk_minutes * 60
-                    )
-                    
-                    if result is not None:
-                        return result
-                    
-                    if attempt_chunk_minutes <= 1.25:  # Don't go below 1.25 minutes
-                        log.error("Even very small chunks are failing. Your audio may be too complex for available GPU memory.")
-                        break
-                    
-                    log.warning(f"{attempt_chunk_minutes}-minute chunks too large, trying smaller...")
+                # Calculate padding needed
+                target_duration_ms = int(effective_min_duration * 1000)
+                padding_duration_ms = target_duration_ms - original_duration_ms
                 
-                return None
-            else:
-                # Single file processing
-                log.info(f"Audio is {duration_minutes:.1f} minutes long. Processing as single file...")
-                return _process_single_file(
-                    input_audio_file, checkpoint_path, output_dir, vocals_output_filename,
-                    bandit_repo_path, temp_config_path
-                )
+                if padding_duration_ms > 0:
+                    # Create silence for padding
+                    silence = AudioSegment.silent(duration=padding_duration_ms)
+                    padded_audio = original_audio + silence
+                    
+                    # Create temporary file for padded audio
+                    temp_padded_file_path = input_audio_file.parent / f"temp_padded_{input_audio_file.stem}.wav"
+                    
+                    # Export padded audio
+                    padded_audio.export(str(temp_padded_file_path), format="wav")
+                    processed_input_path = temp_padded_file_path
+                    padding_applied = True
+                    
+                    log.info(f"Applied {padding_duration_ms}ms padding. Temporary file: {temp_padded_file_path.name}")
                 
-        except Exception as e:
-            log.warning(f"Could not analyze audio: {e}. Attempting direct processing...")
-            return _process_single_file(
-                input_audio_file, checkpoint_path, output_dir, vocals_output_filename,
-                bandit_repo_path, temp_config_path
-            )
-    
-    except Exception as e:
-        log.error(f"[bold red]Bandit-v2 vocal separation failed: {e}[/]")
-        return None
-    finally:
-        if temp_config_path.exists():
-            temp_config_path.unlink(missing_ok=True)
-
-
-def _process_single_file(input_file, checkpoint_path, output_dir, final_output_path, bandit_repo_path, temp_config_path):
-    """Process a single file without chunking."""
-    
-    cmd = [
-        sys.executable, "inference.py", "--config-name", "inference_temp",
-        f"ckpt_path={checkpoint_path.resolve()}",
-        f"+test_audio={input_file.resolve()}",
-        f"+output_path={output_dir.resolve()}",
-        f"+model_variant=speech"
-    ]
-    
-    env = os.environ.copy()
-    env["REPO_ROOT"] = str(bandit_repo_path)
-    env["HYDRA_FULL_ERROR"] = "1"
-    if DEVICE.type == "cuda":
-        env["CUDA_VISIBLE_DEVICES"] = "0"
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        torch.cuda.empty_cache()  # Clear cache before processing
-    
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), 
-                TimeElapsedColumn(), console=console) as progress:
-        task = progress.add_task("Bandit-v2 (vocals)...", total=None)
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(bandit_repo_path))
-        progress.update(task, completed=1, total=1)
-    
-    if result.returncode == 0:
-        expected_output = output_dir / "speech_estimate.wav"
-        if expected_output.exists():
-            shutil.move(str(expected_output), str(final_output_path))
-            log.info(f"[green]✓ Bandit-v2 vocal separation completed. Vocals saved to: {final_output_path.name}[/]")
-            return final_output_path
-    else:
-        print("\n========== BANDIT FULL ERROR OUTPUT ==========")
-        print("STDERR:")
-        print(result.stderr)
-        print("\nSTDOUT:")
-        print(result.stdout)
-        print("========== END BANDIT ERROR ==========\n")
-        
-        if "CUDA out of memory" in result.stderr:
-            log.error("GPU out of memory. File may be too long or complex.")
-        return None
-    
-
-
-def _process_in_chunks(input_file, checkpoint_path, output_dir, final_output_path, 
-                      bandit_repo_path, temp_config_path, duration_seconds, sample_rate, 
-                      num_channels, chunk_duration):
-    """Process audio in chunks with crossfading."""
-    
-    temp_dir = output_dir / "__temp_chunks"
-    temp_dir.mkdir(exist_ok=True)
-    
-    try:
-        crossfade_duration = 0.5  # 0.5 seconds crossfade
-        chunks_processed = []
-        
-        chunk_start = 0
-        chunk_idx = 0
-        failed_chunks = []
-        
-        while chunk_start < duration_seconds:
-            # Calculate chunk boundaries with crossfade
-            actual_start = max(0, chunk_start - crossfade_duration if chunk_idx > 0 else chunk_start)
-            chunk_end = min(duration_seconds, chunk_start + chunk_duration)
-            actual_end = min(duration_seconds, chunk_end + crossfade_duration if chunk_end < duration_seconds else chunk_end)
-            
-            log.info(f"Processing chunk {chunk_idx + 1}/{int(duration_seconds/chunk_duration)+1} ({actual_start/60:.1f}-{actual_end/60:.1f} min)")
-            
-            # Extract chunk
-            chunk_input = temp_dir / f"chunk_{chunk_idx:03d}_input.wav"
-            ff_trim(input_file, chunk_input, actual_start, actual_end, 
-                   target_sr=sample_rate, target_ac=num_channels)
-            
-            # Process chunk
-            chunk_output_dir = temp_dir / f"chunk_{chunk_idx:03d}_output"
-            chunk_output_dir.mkdir(exist_ok=True)
-            
-            # Clear GPU cache before each chunk
-            if DEVICE.type == "cuda":
-                torch.cuda.empty_cache()
-            
-            cmd = [
-                sys.executable, "inference.py", "--config-name", "inference_temp",
-                f"ckpt_path={checkpoint_path.resolve()}",
-                f"+test_audio={chunk_input.resolve()}",
-                f"+output_path={chunk_output_dir.resolve()}",
-                f"+model_variant=speech",
-                "++inference.kwargs.inference_batch_size=1"  # FIX: Override batch size to 1
-            ]
-            
-            env = os.environ.copy()
-            env["REPO_ROOT"] = str(bandit_repo_path)
-            env["HYDRA_FULL_ERROR"] = "1"
-            if DEVICE.type == "cuda":
-                env["CUDA_VISIBLE_DEVICES"] = "0"
-                env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-            
-            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), 
-                        TimeElapsedColumn(), console=console) as progress:
-                task = progress.add_task(f"Chunk {chunk_idx + 1}...", total=None)
-                result = subprocess.run(cmd, capture_output=True, text=True, env=env, 
-                                      cwd=str(bandit_repo_path))
-                progress.update(task, completed=1, total=1)
-            
-            if result.returncode == 0:
-                expected_output = chunk_output_dir / "speech_estimate.wav"
-                if expected_output.exists():
-                    chunk_output = temp_dir / f"chunk_{chunk_idx:03d}_vocals.wav"
-                    shutil.move(str(expected_output), str(chunk_output))
-                    chunks_processed.append({
-                        'path': chunk_output,
-                        'idx': chunk_idx,
-                        'start': actual_start,
-                        'chunk_start': chunk_start,
-                        'chunk_end': chunk_end,
-                        'has_pre_crossfade': chunk_idx > 0,
-                        'has_post_crossfade': chunk_end < duration_seconds
-                    })
-                else:
-                    log.error(f"Chunk {chunk_idx + 1} output not found")
-                    failed_chunks.append(chunk_idx)
-            else:
-                log.error(f"Chunk {chunk_idx + 1} processing failed")
-                print("\n========== BANDIT ERROR OUTPUT ==========")
-                print(f"Command: {' '.join(cmd)}")
-                print(f"\nSTDERR:\n{result.stderr}")
-                print(f"\nSTDOUT:\n{result.stdout}")
-                print("========== END ERROR ==========\n")
-                
-                if "CUDA out of memory" in result.stderr:
-                    log.error("CUDA out of memory detected in error")
-                    # Don't continue if memory error - need smaller chunks
-                    return None
-                failed_chunks.append(chunk_idx)
-            
-            # Clean up input
-            chunk_input.unlink(missing_ok=True)
-            
-            # Next chunk
-            chunk_start = chunk_end
-            chunk_idx += 1
-        
-        if not chunks_processed:
-            log.error("No chunks were successfully processed")
-            return None
-        
-        if failed_chunks:
-            log.warning(f"Failed to process {len(failed_chunks)} chunks: {failed_chunks}")
-            log.warning("Output may have gaps where chunks failed")
-        
-        # Concatenate with crossfading
-        log.info(f"Concatenating {len(chunks_processed)} chunks...")
-        
-        # Simple concatenation for single chunk
-        if len(chunks_processed) == 1:
-            shutil.copy(str(chunks_processed[0]['path']), str(final_output_path))
+            except Exception as pad_err:
+                log.warning(f"Failed to apply padding: {pad_err}")
+                log.info("Proceeding with original audio file...")
+                processed_input_path = input_audio_file
         else:
-            # Build concat list with proper ordering
-            concat_list = temp_dir / "concat_list.txt"
-            with open(concat_list, 'w') as f:
-                for chunk in sorted(chunks_processed, key=lambda x: x['idx']):
-                    f.write(f"file '{chunk['path'].resolve().as_posix()}'\n")
+            if audio_duration_seconds is not None:
+                log.info(f"Audio duration {audio_duration_seconds:.2f}s is sufficient. No padding needed.")
+
+        # Create a temporary file with proper format for the model if needed
+        temp_input_file = input_audio_file.parent / f"temp_for_separator_{input_audio_file.stem}.wav"
+
+        # Define output names for the separated stems
+        output_names = {
+            "Vocals": vocals_output_filename.stem,
+            "Instrumental": f"{input_audio_file.stem}_instrumental_bs_roformer"
+        }          # Perform separation on the processed input (potentially padded)
+        log.info(f"Starting separation process for: {processed_input_path.name}")
+        
+        try:
+            # Use separate method with the processed input path
+            output_files = audio_separator.separate([str(processed_input_path)])
             
-            # Use ffmpeg to concatenate
-            (ffmpeg
-             .input(str(concat_list), format='concat', safe=0)
-             .output(str(final_output_path), acodec='pcm_s16le', ar=sample_rate, ac=num_channels)
-             .overwrite_output()
-             .run(quiet=True))
+            if not output_files:
+                log.error("No output files returned from audio_separator.separate()")
+                # Clean up temporary padded file if it was created
+                if temp_padded_file_path and temp_padded_file_path.exists():
+                    temp_padded_file_path.unlink()
+                return None, None
+                
+        except Exception as sep_err:
+            log.error(f"Separation process failed: {sep_err}")
+            log.info("Trying alternative separation approach...")
+              # Try with different parameters or fallback
+            try:
+                # Alternative approach - let audio-separator handle file names
+                separator_temp_dir = input_audio_file.parent / "temp_separator_output"
+                separator_temp_dir.mkdir(exist_ok=True)
+                  # Set output directory for the separator
+                audio_separator.output_dir = str(separator_temp_dir)
+                output_files = audio_separator.separate([str(processed_input_path)])
+                
+            except Exception as sep_err2:
+                log.error(f"Alternative separation also failed: {sep_err2}")
+                return None, None
         
-        log.info(f"[green]✓ Bandit-v2 vocal separation completed (processed in {len(chunks_processed)} chunks)[/]")
-        return final_output_path
+        vocals_file = None
+        instrumental_file = None
         
-    finally:
-        # Clean up
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        # Process the output files - audio-separator typically outputs with specific naming
+        for file_path in output_files:
+            file_path_obj = Path(file_path)
+            log.info(f"Processing separator output: {file_path_obj.name}")
+            
+            # Check for vocals (common patterns: vocals, voice, Vocals)
+            if any(keyword in file_path_obj.name.lower() for keyword in ['vocals', 'voice']):
+                # Move vocals to the correct directory
+                try:
+                    if file_path_obj != vocals_output_filename:
+                        shutil.move(str(file_path_obj), str(vocals_output_filename))
+                    vocals_file = vocals_output_filename
+                    log.info(f"Moved vocals file to: {vocals_output_filename}")
+                except Exception as move_err:
+                    log.warning(f"Failed to move vocals file: {move_err}")
+                    vocals_file = file_path_obj
+                
+            # Check for instrumental (common patterns: instrumental, music, accompaniment)
+            elif any(keyword in file_path_obj.name.lower() for keyword in ['instrumental', 'music', 'accompaniment']):
+                # Move instrumental to the correct directory if specified
+                if instrumental_output_filename:
+                    try:
+                        if file_path_obj != instrumental_output_filename:
+                            shutil.move(str(file_path_obj), str(instrumental_output_filename))
+                        instrumental_file = instrumental_output_filename
+                        log.info(f"Moved instrumental file to: {instrumental_output_filename}")
+                    except Exception as move_err:
+                        log.warning(f"Failed to move instrumental file: {move_err}")
+                        instrumental_file = file_path_obj
+                else:
+                    # If no instrumental directory specified, just note the file
+                    instrumental_file = file_path_obj
+                    log.info(f"Instrumental file available at: {file_path_obj}")
+            
+            else:
+                log.info(f"Unknown output file type: {file_path_obj.name}")
+        
+        # Verify outputs
+        if vocals_file and vocals_file.exists():
+            log.info(f"✓ Vocal separation completed: {vocals_file.name}")
+        else:
+            log.warning("Failed to create vocals output")
+            vocals_file = None
+            
+        if instrumental_file and instrumental_file.exists():
+            log.info(f"✓ Instrumental separation completed: {instrumental_file.name}")
+        else:
+            log.warning("Failed to create instrumental output")
+            instrumental_file = None
+        
+        # Trim padding from output files if padding was applied
+        if padding_applied and original_duration_ms is not None:
+            log.info("Trimming padding from separated output files...")
+            
+            # Trim vocals file if it exists
+            if vocals_file and vocals_file.exists():
+                try:
+                    vocals_audio = AudioSegment.from_wav(str(vocals_file))
+                    trimmed_vocals = vocals_audio[:original_duration_ms]
+                    trimmed_vocals.export(str(vocals_file), format="wav")
+                    log.info(f"Trimmed padding from vocals file: {vocals_file.name}")
+                except Exception as trim_err:
+                    log.warning(f"Failed to trim padding from vocals file: {trim_err}")
+            
+            # Trim instrumental file if it exists
+            if instrumental_file and instrumental_file.exists():
+                try:
+                    instrumental_audio = AudioSegment.from_wav(str(instrumental_file))
+                    trimmed_instrumental = instrumental_audio[:original_duration_ms]
+                    trimmed_instrumental.export(str(instrumental_file), format="wav")
+                    log.info(f"Trimmed padding from instrumental file: {instrumental_file.name}")
+                except Exception as trim_err:
+                    log.warning(f"Failed to trim padding from instrumental file: {trim_err}")
+        
+        # Clean up temporary padded file if it was created
+        if temp_padded_file_path and temp_padded_file_path.exists():
+            try:
+                temp_padded_file_path.unlink()
+                log.info(f"Cleaned up temporary padded file: {temp_padded_file_path.name}")
+            except Exception as cleanup_err:
+                log.warning(f"Failed to clean up temporary padded file: {cleanup_err}")
+          # Clean up temporary file if created
+        if 'temp_input_file' in locals() and temp_input_file.exists():
+            temp_input_file.unlink()
+        
+        return vocals_file, instrumental_file
+            
+    except Exception as e:
+        log.error(f"Audio Separator vocal separation failed: {e}")
+        # Clean up temporary padded file if it was created
+        if 'temp_padded_file_path' in locals() and temp_padded_file_path and temp_padded_file_path.exists():
+            try:
+                temp_padded_file_path.unlink()
+                log.info(f"Cleaned up temporary padded file after error: {temp_padded_file_path.name}")
+            except Exception as cleanup_err:
+                log.warning(f"Failed to clean up temporary padded file after error: {cleanup_err}")
+        # Clean up temporary file if created
+        if 'temp_input_file' in locals() and temp_input_file.exists():
+            temp_input_file.unlink()
+        return None, None
 
 
 def diarize_audio(
-    input_audio_file: Path, tmp_dir: Path, huggingface_token: str,
-    model_config: dict, dry_run: bool = False
+    input_audio_file: Path,
+    tmp_dir: Path,
+    huggingface_token: str,
+    model_config: dict,
+    dry_run: bool = False,
 ) -> Annotation | None:
     # PyAnnote 3.1 is the target
     model_name = model_config.get("diar_model", "pyannote/speaker-diarization-3.1")
     # Ensure it does not use 3.0, even if specified in args by mistake. Forcing 3.1.
     if "3.0" in model_name:
-        log.warning(f"Requested diarization model '{model_name}' seems to be v3.0. Upgrading to 'pyannote/speaker-diarization-3.1'.")
+        log.warning(
+            f"Requested diarization model '{model_name}' seems to be v3.0. Upgrading to 'pyannote/speaker-diarization-3.1'."
+        )
         model_name = "pyannote/speaker-diarization-3.1"
-        
+
     hyper_params = model_config.get("diar_hyperparams", {})
-    log.info(f"Starting speaker diarization for: {input_audio_file.name} (Model: {model_name})")
-    if DEVICE.type == "cuda": torch.cuda.empty_cache()
+    log.info(
+        f"Starting speaker diarization for: {input_audio_file.name} (Model: {model_name})"
+    )
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
     ensure_dir_exists(tmp_dir)
-    if hyper_params: log.info(f"With diarization hyperparameters: {hyper_params}")
-    
+    if hyper_params:
+        log.info(f"With diarization hyperparameters: {hyper_params}")
+
     try:
-        pipeline = PyannotePipeline.from_pretrained(model_name, use_auth_token=huggingface_token)
-        if hasattr(pipeline, "to") and callable(getattr(pipeline, "to")): pipeline = pipeline.to(DEVICE)
+        pipeline = PyannotePipeline.from_pretrained(
+            model_name, use_auth_token=huggingface_token
+        )
+        if hasattr(pipeline, "to") and callable(getattr(pipeline, "to")):
+            pipeline = pipeline.to(DEVICE)
         log.info(f"Diarization model '{model_name}' loaded to {DEVICE.type.upper()}.")
     except Exception as e:
         log.error(f"[bold red]Error loading diarization model '{model_name}': {e}[/]")
-        log.error("Please ensure you have accepted the model's terms on Hugging Face and your token is correct.")
-        return None # Changed from raise to allow pipeline to potentially continue or handle
+        log.error(
+            "Please ensure you have accepted the model's terms on Hugging Face and your token is correct."
+        )
+        return None  # Changed from raise to allow pipeline to potentially continue or handle
 
     target_audio_for_processing = input_audio_file
     if dry_run:
         cut_audio_file_path = tmp_dir / f"{input_audio_file.stem}_60s_diar_dryrun.wav"
-        log.warning(f"[DRY-RUN] Using first 60s for diarization. Temp: {cut_audio_file_path.name}")
+        log.warning(
+            f"[DRY-RUN] Using first 60s for diarization. Temp: {cut_audio_file_path.name}"
+        )
         try:
             # Diarization models typically expect 16kHz
-            ff_trim(input_audio_file, cut_audio_file_path, 0, 60, target_sr=16000) 
+            ff_trim(input_audio_file, cut_audio_file_path, 0, 60, target_sr=16000)
             target_audio_for_processing = cut_audio_file_path
         except Exception as e:
-            log.error(f"Failed to create dry-run audio for diarization: {e}. Using full audio.")
+            log.error(
+                f"Failed to create dry-run audio for diarization: {e}. Using full audio."
+            )
 
-    log.info(f"Running diarization on {DEVICE.type.upper()} for {target_audio_for_processing.name}...")
+    log.info(
+        f"Running diarization on {DEVICE.type.upper()} for {target_audio_for_processing.name}..."
+    )
     try:
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), TimeElapsedColumn(), console=console) as progress:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
             task = progress.add_task("Diarizing...", total=None)
             # PyAnnote pipeline expects 'audio' key to be path string
-            diarization_result = pipeline({"uri": target_audio_for_processing.stem, "audio": str(target_audio_for_processing)}, **hyper_params)
+            diarization_result = pipeline(
+                {
+                    "uri": target_audio_for_processing.stem,
+                    "audio": str(target_audio_for_processing),
+                },
+                **hyper_params,
+            )
             progress.update(task, completed=1, total=1)
         num_speakers = len(diarization_result.labels())
         total_speech_duration = diarization_result.get_timeline().duration()
-        log.info(f"[green]✓ Diarization complete.[/] Found {num_speakers} speaker labels. Total speech: {format_duration(total_speech_duration)}.")
-        if num_speakers == 0: log.warning("Diarization resulted in zero speakers.")
+        log.info(
+            f"[green]✓ Diarization complete.[/] Found {num_speakers} speaker labels. Total speech: {format_duration(total_speech_duration)}."
+        )
+        if num_speakers == 0:
+            log.warning("Diarization resulted in zero speakers.")
         return diarization_result
     except RuntimeError as e:
         if "CUDA out of memory" in str(e) and DEVICE.type == "cuda":
             log.error("[bold red]CUDA out of memory during diarization![/]")
-            torch.cuda.empty_cache(); log.warning("Attempting diarization on CPU (slower)...")
+            torch.cuda.empty_cache()
+            log.warning("Attempting diarization on CPU (slower)...")
             try:
                 pipeline = pipeline.to(torch.device("cpu"))
                 log.info("Switched diarization pipeline to CPU.")
-                with Progress(SpinnerColumn(),TextColumn("[progress.description]{task.description}"),TimeElapsedColumn(),console=console) as p_cpu:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as p_cpu:
                     task_cpu = p_cpu.add_task("Diarizing (CPU)...", total=None)
-                    res_cpu = pipeline({"uri":target_audio_for_processing.stem,"audio":str(target_audio_for_processing)}, **hyper_params); p_cpu.update(task_cpu,completed=1,total=1)
-                log.info(f"[green]✓ Diarization (CPU) complete.[/] Found {len(res_cpu.labels())} spk. Total speech: {format_duration(res_cpu.get_timeline().duration())}.")
+                    res_cpu = pipeline(
+                        {
+                            "uri": target_audio_for_processing.stem,
+                            "audio": str(target_audio_for_processing),
+                        },
+                        **hyper_params,
+                    )
+                    p_cpu.update(task_cpu, completed=1, total=1)
+                log.info(
+                    f"[green]✓ Diarization (CPU) complete.[/] Found {len(res_cpu.labels())} spk. Total speech: {format_duration(res_cpu.get_timeline().duration())}."
+                )
                 return res_cpu
             except Exception as cpu_e:
-                log.error(f"Diarization failed on GPU (OOM) and subsequently on CPU: {cpu_e}")
+                log.error(
+                    f"Diarization failed on GPU (OOM) and subsequently on CPU: {cpu_e}"
+                )
                 return None
         else:
             log.error(f"Runtime error during diarization: {e}")
@@ -580,25 +835,29 @@ def diarize_audio(
 
 
 def detect_overlapped_regions(
-    input_audio_file: Path, tmp_dir: Path, huggingface_token: str,
-    osd_model_name: str = "pyannote/overlapped-speech-detection", # Default OSD from original code
-    dry_run: bool = False
+    input_audio_file: Path,
+    tmp_dir: Path,
+    huggingface_token: str,
+    osd_model_name: str = "pyannote/overlapped-speech-detection",  # Default OSD from original code
+    dry_run: bool = False,
 ) -> Timeline | None:
     log.info(f"Starting OSD for: {input_audio_file.name} (OSD Model: {osd_model_name})")
-    if DEVICE.type == "cuda": torch.cuda.empty_cache()
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
     ensure_dir_exists(tmp_dir)
 
     osd_pipeline_instance = None
     # Hyperparameters for OverlappedSpeechDetection from pyannote.audio.pipelines.segmentation.Pipeline
     # These are defaults if segmentation model is used.
-    default_osd_hyperparameters = { 
-        "onset": 0.5, "offset": 0.5, 
-        "min_duration_on": 0.05, "min_duration_off": 0.05,
+    default_osd_hyperparameters = {
+        "onset": 0.5,
+        "offset": 0.5,
+        "min_duration_on": 0.05,
+        "min_duration_off": 0.05,
         # For OSD, we are interested in segments with 2 or more speakers.
         # These can be tuned.
-        "segmentation_min_duration_off": 0.0 # from pyannote.audio.pipelines.utils
+        "segmentation_min_duration_off": 0.0,  # from pyannote.audio.pipelines.utils
     }
-
 
     try:
         # pyannote/overlapped-speech-detection is a dedicated pipeline
@@ -609,8 +868,13 @@ def detect_overlapped_regions(
             )
         # pyannote/segmentation-3.0 (or similar like voicefixer/mdx23c-segmentation) are base models
         # that can be wrapped by OverlappedSpeechDetection pipeline.
-        elif osd_model_name.startswith("pyannote/segmentation") or "segmentation" in osd_model_name:
-            log.info(f"Loading '{osd_model_name}' as base segmentation model for OSD pipeline...")
+        elif (
+            osd_model_name.startswith("pyannote/segmentation")
+            or "segmentation" in osd_model_name
+        ):
+            log.info(
+                f"Loading '{osd_model_name}' as base segmentation model for OSD pipeline..."
+            )
             segmentation_model = PyannoteModel.from_pretrained(
                 osd_model_name, use_auth_token=huggingface_token
             )
@@ -619,9 +883,11 @@ def detect_overlapped_regions(
                 # device=DEVICE # OSDPipeline takes device here
             )
             # OSDPipeline needs instantiation of params if not set
-            osd_pipeline_instance.instantiate(default_osd_hyperparameters) 
-            log.info(f"Instantiated OverlappedSpeechDetection pipeline (from '{osd_model_name}') with parameters: {default_osd_hyperparameters}.")
-        else: # Fallback for other potential pipeline types, though less common for OSD
+            osd_pipeline_instance.instantiate(default_osd_hyperparameters)
+            log.info(
+                f"Instantiated OverlappedSpeechDetection pipeline (from '{osd_model_name}') with parameters: {default_osd_hyperparameters}."
+            )
+        else:  # Fallback for other potential pipeline types, though less common for OSD
             log.warning(
                 f"OSD model string '{osd_model_name}' not recognized as a specific type. "
                 "Attempting to load as a generic PyannotePipeline. This may not yield overlap directly."
@@ -631,32 +897,55 @@ def detect_overlapped_regions(
             )
 
         if osd_pipeline_instance is None:
-            raise RuntimeError(f"Failed to load or instantiate OSD pipeline for '{osd_model_name}'. Instance is None.")
+            raise RuntimeError(
+                f"Failed to load or instantiate OSD pipeline for '{osd_model_name}'. Instance is None."
+            )
 
         # Move to device
-        if hasattr(osd_pipeline_instance, "to") and callable(getattr(osd_pipeline_instance, "to")):
-            log.debug(f"Moving OSD pipeline for '{osd_model_name}' to {DEVICE.type.upper()}")
+        if hasattr(osd_pipeline_instance, "to") and callable(
+            getattr(osd_pipeline_instance, "to")
+        ):
+            log.debug(
+                f"Moving OSD pipeline for '{osd_model_name}' to {DEVICE.type.upper()}"
+            )
             osd_pipeline_instance = osd_pipeline_instance.to(DEVICE)
         # If it's an OSDPipeline, the model is 'segmentation_model' or 'segmentation' (check pyannote version)
-        elif hasattr(osd_pipeline_instance, 'segmentation_model') and hasattr(osd_pipeline_instance.segmentation_model, 'to'):
-            log.debug(f"Moving OSD pipeline's segmentation_model to {DEVICE.type.upper()}")
-            osd_pipeline_instance.segmentation_model = osd_pipeline_instance.segmentation_model.to(DEVICE)
-        elif hasattr(osd_pipeline_instance, 'segmentation') and hasattr(osd_pipeline_instance.segmentation, 'to'): # segmentation is the model instance
-             log.debug(f"Moving OSD pipeline's segmentation (model) to {DEVICE.type.upper()}")
-             osd_pipeline_instance.segmentation = osd_pipeline_instance.segmentation.to(DEVICE)
+        elif hasattr(osd_pipeline_instance, "segmentation_model") and hasattr(
+            osd_pipeline_instance.segmentation_model, "to"
+        ):
+            log.debug(
+                f"Moving OSD pipeline's segmentation_model to {DEVICE.type.upper()}"
+            )
+            osd_pipeline_instance.segmentation_model = (
+                osd_pipeline_instance.segmentation_model.to(DEVICE)
+            )
+        elif hasattr(osd_pipeline_instance, "segmentation") and hasattr(
+            osd_pipeline_instance.segmentation, "to"
+        ):  # segmentation is the model instance
+            log.debug(
+                f"Moving OSD pipeline's segmentation (model) to {DEVICE.type.upper()}"
+            )
+            osd_pipeline_instance.segmentation = osd_pipeline_instance.segmentation.to(
+                DEVICE
+            )
 
-
-        log.info(f"OSD model/pipeline '{osd_model_name}' successfully prepared on {DEVICE.type.upper()}.")
+        log.info(
+            f"OSD model/pipeline '{osd_model_name}' successfully prepared on {DEVICE.type.upper()}."
+        )
 
     except Exception as e:
-        log.error(f"[bold red]Fatal error loading/instantiating OSD model/pipeline '{osd_model_name}': {type(e).__name__} - {e}[/]")
+        log.error(
+            f"[bold red]Fatal error loading/instantiating OSD model/pipeline '{osd_model_name}': {type(e).__name__} - {e}[/]"
+        )
         # ... (error details from original code) ...
-        return None # Changed from raise
+        return None  # Changed from raise
 
     target_audio_for_processing = input_audio_file
     if dry_run:
         cut_audio_file_path = tmp_dir / f"{input_audio_file.stem}_60s_osd_dryrun.wav"
-        log.warning(f"[DRY-RUN] Using first 60s for OSD. Temp: {cut_audio_file_path.name}")
+        log.warning(
+            f"[DRY-RUN] Using first 60s for OSD. Temp: {cut_audio_file_path.name}"
+        )
         try:
             # OSD models also typically expect 16kHz
             ff_trim(input_audio_file, cut_audio_file_path, 0, 60, target_sr=16000)
@@ -664,100 +953,177 @@ def detect_overlapped_regions(
         except Exception as e:
             log.error(f"Failed to create dry-run audio for OSD: {e}. Using full audio.")
 
-    log.info(f"Running OSD on {DEVICE.type.upper()} for {target_audio_for_processing.name}...")
+    log.info(
+        f"Running OSD on {DEVICE.type.upper()} for {target_audio_for_processing.name}..."
+    )
     try:
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), TimeElapsedColumn(), console=console) as progress:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
             task = progress.add_task("Detecting overlaps...", total=None)
             # PyAnnote pipeline expects 'audio' key to be path string
-            osd_annotation_or_timeline = osd_pipeline_instance({"uri": target_audio_for_processing.stem, "audio": str(target_audio_for_processing)})
+            osd_annotation_or_timeline = osd_pipeline_instance(
+                {
+                    "uri": target_audio_for_processing.stem,
+                    "audio": str(target_audio_for_processing),
+                }
+            )
             progress.update(task, completed=1, total=1)
-        
+
         overlap_timeline = Timeline()
         # OSDPipeline directly returns a Timeline of overlapped regions.
         # Generic pipelines return an Annotation.
         if isinstance(osd_annotation_or_timeline, Timeline):
             overlap_timeline = osd_annotation_or_timeline
-            log.info("OSD pipeline returned a Timeline directly (expected for OverlappedSpeechDetection).")
+            log.info(
+                "OSD pipeline returned a Timeline directly (expected for OverlappedSpeechDetection)."
+            )
         elif isinstance(osd_annotation_or_timeline, Annotation):
             osd_annotation = osd_annotation_or_timeline
             # Logic from original code to extract overlap from Annotation
             if "overlap" in osd_annotation.labels():
                 overlap_timeline.update(osd_annotation.label_timeline("overlap"))
             # ... (other label checking logic from original code if 'overlap' not present) ...
-            else: # Try to infer from segmentation model output (e.g., speaker count > 1)
+            else:  # Try to infer from segmentation model output (e.g., speaker count > 1)
                 labels_from_osd = osd_annotation.labels()
-                log.debug(f"OSD with '{osd_model_name}' did not directly yield 'overlap' label from Annotation. Checking other labels: {labels_from_osd}")
+                log.debug(
+                    f"OSD with '{osd_model_name}' did not directly yield 'overlap' label from Annotation. Checking other labels: {labels_from_osd}"
+                )
                 found_overlap_in_annotation = False
                 for label in labels_from_osd:
                     # For segmentation models (e.g. pyannote/segmentation-3.0), labels might be 'speakerN', 'noise', 'speech'.
                     # Or it might give speaker counts like 'SPEAKER_00+SPEAKER_01', '2speakers'.
                     # This part needs careful checking based on the actual model's output labels.
                     # A common pattern from segmentation models used in OSDPipeline is labels like 'overlap' or counting speakers.
-                    if "overlap" in label.lower(): # Check if any label contains 'overlap'
-                         overlap_timeline.update(osd_annotation.label_timeline(label))
-                         found_overlap_in_annotation = True
-                         log.info(f"Using label '{label}' from Annotation as overlap.")
-                         break
+                    if (
+                        "overlap" in label.lower()
+                    ):  # Check if any label contains 'overlap'
+                        overlap_timeline.update(osd_annotation.label_timeline(label))
+                        found_overlap_in_annotation = True
+                        log.info(f"Using label '{label}' from Annotation as overlap.")
+                        break
                     # Try to infer from speaker count in label (e.g. from a segmentation model that counts speakers)
-                    try: # Example: 'speaker_count_2', '2_speakers_MIX', 'INTERSECTION'
-                        if re.search(r'(\d+)\s*speaker', label, re.IGNORECASE) and int(re.search(r'(\d+)\s*speaker', label, re.IGNORECASE).group(1)) >= 2:
-                            overlap_timeline.update(osd_annotation.label_timeline(label))
-                            found_overlap_in_annotation = True; break
-                        if '+' in label or 'intersection' in label.lower() or 'overlap' in label.lower(): # Heuristic for multi-speaker labels
-                            overlap_timeline.update(osd_annotation.label_timeline(label))
-                            found_overlap_in_annotation = True; break
-                    except (ValueError, AttributeError): pass
+                    try:  # Example: 'speaker_count_2', '2_speakers_MIX', 'INTERSECTION'
+                        if (
+                            re.search(r"(\d+)\s*speaker", label, re.IGNORECASE)
+                            and int(
+                                re.search(
+                                    r"(\d+)\s*speaker", label, re.IGNORECASE
+                                ).group(1)
+                            )
+                            >= 2
+                        ):
+                            overlap_timeline.update(
+                                osd_annotation.label_timeline(label)
+                            )
+                            found_overlap_in_annotation = True
+                            break
+                        if (
+                            "+" in label
+                            or "intersection" in label.lower()
+                            or "overlap" in label.lower()
+                        ):  # Heuristic for multi-speaker labels
+                            overlap_timeline.update(
+                                osd_annotation.label_timeline(label)
+                            )
+                            found_overlap_in_annotation = True
+                            break
+                    except (ValueError, AttributeError):
+                        pass
                 if not found_overlap_in_annotation and labels_from_osd:
-                    log.warning(f"Could not determine specific overlap label from Annotation via '{osd_model_name}'. Labels: {labels_from_osd}. No overlap inferred from this Annotation.")
+                    log.warning(
+                        f"Could not determine specific overlap label from Annotation via '{osd_model_name}'. Labels: {labels_from_osd}. No overlap inferred from this Annotation."
+                    )
 
         else:
-            log.error(f"OSD pipeline returned an unexpected type: {type(osd_annotation_or_timeline)}. Expected Timeline or Annotation.")
-            return Timeline() # Return empty timeline
+            log.error(
+                f"OSD pipeline returned an unexpected type: {type(osd_annotation_or_timeline)}. Expected Timeline or Annotation."
+            )
+            return Timeline()  # Return empty timeline
 
-        overlap_timeline = overlap_timeline.support() # Merge overlapping segments within the timeline
+        overlap_timeline = (
+            overlap_timeline.support()
+        )  # Merge overlapping segments within the timeline
         total_overlap_duration = overlap_timeline.duration()
-        log.info(f"[green]✓ Overlap detection complete.[/] Total overlap: {format_duration(total_overlap_duration)}.")
-        if total_overlap_duration == 0: log.info("No overlapped speech detected by OSD model or inferred from its output.")
+        log.info(
+            f"[green]✓ Overlap detection complete.[/] Total overlap: {format_duration(total_overlap_duration)}."
+        )
+        if total_overlap_duration == 0:
+            log.info(
+                "No overlapped speech detected by OSD model or inferred from its output."
+            )
         return overlap_timeline
 
-    except RuntimeError as e: # GPU OOM
+    except RuntimeError as e:  # GPU OOM
         if "CUDA out of memory" in str(e) and DEVICE.type == "cuda":
             log.error("[bold red]CUDA out of memory during OSD![/]")
-            torch.cuda.empty_cache(); log.warning("Attempting OSD on CPU (slower)...")
+            torch.cuda.empty_cache()
+            log.warning("Attempting OSD on CPU (slower)...")
             cpu_device = torch.device("cpu")
             try:
                 osd_pipeline_cpu = None
                 # Re-initialize OSD pipeline for CPU
                 if osd_model_name == "pyannote/overlapped-speech-detection":
-                    osd_pipeline_cpu = PyannotePipeline.from_pretrained(osd_model_name, use_auth_token=huggingface_token).to(cpu_device)
-                elif osd_model_name.startswith("pyannote/segmentation") or "segmentation" in osd_model_name:
-                    segmentation_model_cpu = PyannoteModel.from_pretrained(osd_model_name, use_auth_token=huggingface_token).to(cpu_device)
-                    osd_pipeline_cpu = PyannoteOSDPipeline(segmentation=segmentation_model_cpu)
+                    osd_pipeline_cpu = PyannotePipeline.from_pretrained(
+                        osd_model_name, use_auth_token=huggingface_token
+                    ).to(cpu_device)
+                elif (
+                    osd_model_name.startswith("pyannote/segmentation")
+                    or "segmentation" in osd_model_name
+                ):
+                    segmentation_model_cpu = PyannoteModel.from_pretrained(
+                        osd_model_name, use_auth_token=huggingface_token
+                    ).to(cpu_device)
+                    osd_pipeline_cpu = PyannoteOSDPipeline(
+                        segmentation=segmentation_model_cpu
+                    )
                     osd_pipeline_cpu.instantiate(default_osd_hyperparameters)
-                else: # Generic
-                    osd_pipeline_cpu = PyannotePipeline.from_pretrained(osd_model_name, use_auth_token=huggingface_token).to(cpu_device)
+                else:  # Generic
+                    osd_pipeline_cpu = PyannotePipeline.from_pretrained(
+                        osd_model_name, use_auth_token=huggingface_token
+                    ).to(cpu_device)
 
-                if osd_pipeline_cpu is None: raise RuntimeError("Failed to create OSD pipeline for CPU fallback.")
+                if osd_pipeline_cpu is None:
+                    raise RuntimeError(
+                        "Failed to create OSD pipeline for CPU fallback."
+                    )
                 log.info("Switched OSD pipeline to CPU.")
-                # ... (CPU OSD processing, similar to GPU block) ...
-                with Progress(SpinnerColumn(),TextColumn("[progress.description]{task.description}"),TimeElapsedColumn(),console=console) as p_cpu:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as p_cpu:
                     task_cpu = p_cpu.add_task("Detecting overlaps (CPU)...", total=None)
-                    osd_res_cpu = osd_pipeline_cpu({"uri":target_audio_for_processing.stem,"audio":str(target_audio_for_processing)}); p_cpu.update(task_cpu,completed=1,total=1)
-                
+                    osd_res_cpu = osd_pipeline_cpu(
+                        {
+                            "uri": target_audio_for_processing.stem,
+                            "audio": str(target_audio_for_processing),
+                        }
+                    )
+                    p_cpu.update(task_cpu, completed=1, total=1)
+
                 ov_tl_cpu = Timeline()
-                if isinstance(osd_res_cpu, Timeline): ov_tl_cpu = osd_res_cpu
+                if isinstance(osd_res_cpu, Timeline):
+                    ov_tl_cpu = osd_res_cpu
                 elif isinstance(osd_res_cpu, Annotation):
                     # Extract from annotation as in GPU block
-                    if "overlap" in osd_res_cpu.labels(): ov_tl_cpu.update(osd_res_cpu.label_timeline("overlap"))
+                    if "overlap" in osd_res_cpu.labels():
+                        ov_tl_cpu.update(osd_res_cpu.label_timeline("overlap"))
                     # ... (other label checking) ...
                 ov_tl_cpu = ov_tl_cpu.support()
-                log.info(f"[green]✓ OSD (CPU) complete.[/] Total overlap: {format_duration(ov_tl_cpu.duration())}.")
+                log.info(
+                    f"[green]✓ OSD (CPU) complete.[/] Total overlap: {format_duration(ov_tl_cpu.duration())}."
+                )
                 return ov_tl_cpu
 
             except Exception as cpu_e:
                 log.error(f"OSD failed on GPU (OOM) and subsequently on CPU: {cpu_e}")
-                return Timeline() # Return empty on error
-        else: # Other runtime errors
+                return Timeline()  # Return empty on error
+        else:  # Other runtime errors
             log.error(f"Runtime error during OSD: {e}")
             return Timeline()
     except Exception as e:
@@ -766,216 +1132,336 @@ def detect_overlapped_regions(
 
 
 def identify_target_speaker(
-    annotation: Annotation, 
-    input_audio_file: Path, # Audio file from which segments are derived (e.g., bandit output)
-    processed_reference_file: Path, # Reference audio (16kHz mono)
+    annotation: Annotation,
+    input_audio_file: Path,  # Audio file from which segments are derived (e.g., Audio Separator output)
+    processed_reference_file: Path,  # Reference audio (16kHz mono)
     target_name: str,
-    wespeaker_rvector_model # WeSpeaker Deep r-vector model instance
+    wespeaker_rvector_model,  # WeSpeaker Deep r-vector model instance
 ) -> str | None:
-    log.info(f"Identifying '{target_name}' among diarized speakers using WeSpeaker Deep r-vector and reference: {processed_reference_file.name}")
+    log.info(
+        f"Identifying '{target_name}' among diarized speakers using WeSpeaker Deep r-vector and reference: {processed_reference_file.name}"
+    )
 
     if wespeaker_rvector_model is None:
-        log.error("WeSpeaker r-vector model not available for speaker identification. Cannot proceed.")
+        log.error(
+            "WeSpeaker r-vector model not available for speaker identification. Cannot proceed."
+        )
         return None
     if not processed_reference_file.exists():
-        log.error(f"Processed reference audio not found: {processed_reference_file}. Cannot ID target.")
+        log.error(
+            f"Processed reference audio not found: {processed_reference_file}. Cannot ID target."
+        )
         return None
 
     try:
-        ref_embedding = wespeaker_rvector_model.extract_embedding(str(processed_reference_file))
-        log.debug(f"Reference embedding for '{target_name}' extracted, shape: {ref_embedding.shape}")
+        ref_embedding = wespeaker_rvector_model.extract_embedding(
+            str(processed_reference_file)
+        )
+        log.debug(
+            f"Reference embedding for '{target_name}' extracted, shape: {ref_embedding.shape}"
+        )
     except Exception as e:
-        log.error(f"Failed to extract embedding from reference audio '{processed_reference_file.name}' using WeSpeaker: {e}")
+        log.error(
+            f"Failed to extract embedding from reference audio '{processed_reference_file.name}' using WeSpeaker: {e}"
+        )
         return None
 
     # Create a temporary directory for speaker segment audio files
     # This is because WeSpeaker model.extract_embedding expects file paths
-    with tempfile.TemporaryDirectory(prefix="speaker_id_segs_", dir=Path(processed_reference_file).parent) as temp_seg_dir_str:
+    with tempfile.TemporaryDirectory(
+        prefix="speaker_id_segs_", dir=Path(processed_reference_file).parent
+    ) as temp_seg_dir_str:
         temp_seg_dir = Path(temp_seg_dir_str)
-        
+
         speaker_similarities = {}
         unique_speaker_labels = annotation.labels()
         if not unique_speaker_labels:
-            log.error("Diarization produced no speaker labels. Cannot identify target speaker.")
+            log.error(
+                "Diarization produced no speaker labels. Cannot identify target speaker."
+            )
             return None
 
-        log.info(f"Comparing reference of '{target_name}' with {len(unique_speaker_labels)} diarized speakers using WeSpeaker r-vector.")
-        
-        # We need to extract audio segments for each speaker.
-        # The input_audio_file is the source (e.g., bandit output or original).
+        log.info(
+            f"Comparing reference of '{target_name}' with {len(unique_speaker_labels)} diarized speakers using WeSpeaker r-vector."
+        )        # We need to extract audio segments for each speaker.
+        # The input_audio_file is the source (e.g., Audio Separator output or original).
         # Segments from diarization are relative to this input_audio_file.
         # WeSpeaker expects 16kHz for its pre-trained models. Ensure segments are 16kHz.
         # The diarization itself should have run on 16kHz audio, so segment times are for that.
-        # Bandit output SR might be different, so resampling of segments might be needed if input_audio_file is bandit output.
+        # Audio Separator output SR might be different, so resampling of segments might be needed if input_audio_file is Audio Separator output.
         # For simplicity, assume input_audio_file is already at a common SR or ff_slice handles it.
         # It's safer to always resample segments to 16kHz for WeSpeaker.
-        
+
         for spk_label in unique_speaker_labels:
             speaker_segments_timeline = annotation.label_timeline(spk_label)
             if not speaker_segments_timeline:
-                log.debug(f"Speaker label '{spk_label}' has no speech segments. Skipping."); continue
-
-            # Concatenate first N seconds of speech for this speaker to create a representative sample
-            MAX_EMBED_DURATION_PER_SPEAKER = 20.0 # seconds
-            concatenated_speaker_audio_for_embedding = []
+                log.debug(
+                    f"Speaker label '{spk_label}' has no speech segments. Skipping."
+                )
+                continue            # Concatenate first N seconds of speech for this speaker to create a representative sample
+            MAX_EMBED_DURATION_PER_SPEAKER = 20.0  # seconds
             current_duration_for_embedding = 0.0
-            
+
             temp_speaker_audio_list = []
 
             for i, seg in enumerate(speaker_segments_timeline):
-                if current_duration_for_embedding >= MAX_EMBED_DURATION_PER_SPEAKER: break
-                
-                # Slice segment from input_audio_file and resample to 16kHz for WeSpeaker
+                if current_duration_for_embedding >= MAX_EMBED_DURATION_PER_SPEAKER:
+                    break                # Slice segment from input_audio_file and resample to 16kHz for WeSpeaker
                 temp_seg_path = temp_seg_dir / f"{safe_filename(spk_label)}_seg_{i}.wav"
                 try:
-                    # ff_slice will take care of format (wav) and resampling (16kHz mono)
-                    ff_slice(input_audio_file, temp_seg_path, seg.start, seg.end, target_sr=16000, target_ac=1)
+                    # ff_slice_smart will handle intelligent chunking if needed
+                    ff_slice_smart(
+                        input_audio_file,
+                        temp_seg_path,
+                        seg.start,
+                        seg.end,
+                        target_sr=16000,
+                        target_ac=1,
+                    )
                     if temp_seg_path.exists() and temp_seg_path.stat().st_size > 0:
                         temp_speaker_audio_list.append(temp_seg_path)
-                        current_duration_for_embedding += seg.duration # Using original segment duration for tracking
+                        current_duration_for_embedding += (
+                            seg.duration
+                        )  # Using original segment duration for tracking
                     else:
-                        log.warning(f"Failed to create/empty slice for speaker ID: {temp_seg_path.name}")
+                        log.warning(
+                            f"Failed to create/empty slice for speaker ID: {temp_seg_path.name}"
+                        )
                 except Exception as e_slice:
-                    log.warning(f"Slicing segment {i} for speaker {spk_label} failed: {e_slice}")
-            
-            if not temp_speaker_audio_list:
-                log.debug(f"No valid audio segments extracted for speaker '{spk_label}' for embedding. Similarity set to 0.")
-                speaker_similarities[spk_label] = 0.0
-                continue
+                    log.warning(
+                        f"Slicing segment {i} for speaker {spk_label} failed: {e_slice}"
+                    )
 
-            # Create a single audio file for this speaker by concatenating the temp segments
-            speaker_concat_audio_path = temp_seg_dir / f"{safe_filename(spk_label)}_concat_for_embed.wav"
-            if len(temp_speaker_audio_list) == 1: # If only one segment, just use it (rename for consistency)
+            if not temp_speaker_audio_list:
+                log.debug(
+                    f"No valid audio segments extracted for speaker '{spk_label}' for embedding. Similarity set to 0."
+                )
+                speaker_similarities[spk_label] = 0.0
+                continue            # Create a single audio file for this speaker by concatenating the temp segments
+            speaker_concat_audio_path = (
+                temp_seg_dir / f"{safe_filename(spk_label)}_concat_for_embed.wav"
+            )
+            if (
+                len(temp_speaker_audio_list) == 1
+            ):  # If only one segment, just use it (rename for consistency)
                 shutil.copy(temp_speaker_audio_list[0], speaker_concat_audio_path)
             else:
-                concat_list_file = temp_seg_dir / f"{safe_filename(spk_label)}_concat_list.txt"
-                with open(concat_list_file, 'w') as f:
+                concat_list_file = (
+                    temp_seg_dir / f"{safe_filename(spk_label)}_concat_list.txt"
+                )
+                with open(concat_list_file, "w", encoding="utf-8") as f:
                     for p in temp_speaker_audio_list:
                         f.write(f"file '{p.resolve().as_posix()}'\n")
                 try:
-                    (ffmpeg.input(str(concat_list_file), format="concat", safe=0)
-                           .output(str(speaker_concat_audio_path), acodec="pcm_s16le", ar=16000, ac=1)
-                           .overwrite_output().run(quiet=True, capture_stdout=True, capture_stderr=True))
+                    (
+                        ffmpeg.input(str(concat_list_file), format="concat", safe=0)
+                        .output(
+                            str(speaker_concat_audio_path),
+                            acodec="pcm_s16le",
+                            ar=16000,
+                            ac=1,
+                        )
+                        .overwrite_output()
+                        .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                    )
                 except ffmpeg.Error as e_concat:
-                    log.warning(f"ffmpeg concat failed for speaker {spk_label} embedding audio: {e_concat.stderr.decode() if e_concat.stderr else 'ffmpeg error'}. Similarity set to 0.")
+                    log.warning(
+                        f"ffmpeg concat failed for speaker {spk_label} embedding audio: {e_concat.stderr.decode() if e_concat.stderr else 'ffmpeg error'}. Similarity set to 0."
+                    )
                     speaker_similarities[spk_label] = 0.0
                     continue
-            
-            if speaker_concat_audio_path.exists() and speaker_concat_audio_path.stat().st_size > 0:
+
+            if (
+                speaker_concat_audio_path.exists()
+                and speaker_concat_audio_path.stat().st_size > 0
+            ):
                 try:
-                    spk_embedding = wespeaker_rvector_model.extract_embedding(str(speaker_concat_audio_path))
-                    similarity = cos(ref_embedding, spk_embedding) # Using common.cos for numpy arrays
+                    spk_embedding = wespeaker_rvector_model.extract_embedding(
+                        str(speaker_concat_audio_path)
+                    )
+                    similarity = cos(
+                        ref_embedding, spk_embedding
+                    )  # Using common.cos for numpy arrays
                     speaker_similarities[spk_label] = similarity
                 except Exception as e_embed:
-                    log.warning(f"Error extracting WeSpeaker embedding for speaker '{spk_label}': {e_embed}. Similarity set to 0.")
+                    log.warning(
+                        f"Error extracting WeSpeaker embedding for speaker '{spk_label}': {e_embed}. Similarity set to 0."
+                    )
                     speaker_similarities[spk_label] = 0.0
             else:
-                log.debug(f"Concatenated audio for speaker '{spk_label}' embedding is missing or empty. Similarity set to 0.")
+                log.debug(
+                    f"Concatenated audio for speaker '{spk_label}' embedding is missing or empty. Similarity set to 0."
+                )
                 speaker_similarities[spk_label] = 0.0
 
     if not speaker_similarities:
-        log.error(f"Speaker similarity calculation failed for all speakers for '{target_name}'.")
+        log.error(
+            f"Speaker similarity calculation failed for all speakers for '{target_name}'."
+        )
         return None
-        
+
     if all(score == 0.0 for score in speaker_similarities.values()):
-        log.error(f"[bold red]All WeSpeaker similarity scores are zero for '{target_name}'. Cannot reliably ID target.[/]")
+        log.error(
+            f"[bold red]All WeSpeaker similarity scores are zero for '{target_name}'. Cannot reliably ID target.[/]"
+        )
         # Fallback: pick the first speaker label or a placeholder if desired. For now, indicate failure.
-        best_match_label = unique_speaker_labels[0] if unique_speaker_labels else "UNKNOWN_SPEAKER"
+        best_match_label = (
+            unique_speaker_labels[0] if unique_speaker_labels else "UNKNOWN_SPEAKER"
+        )
         max_similarity_score = 0.0
-        log.warning(f"Arbitrarily assigning '{best_match_label}' due to all zero scores (this is a guess).")
+        log.warning(
+            f"Arbitrarily assigning '{best_match_label}' due to all zero scores (this is a guess)."
+        )
     else:
         best_match_label = max(speaker_similarities, key=speaker_similarities.get)
         max_similarity_score = speaker_similarities[best_match_label]
 
-    log.info(f"[green]✓ Identified '{target_name}' as diarization label → [bold]{best_match_label}[/] (WeSpeaker r-vector sim: {max_similarity_score:.4f})[/]")
-    
-    sim_table = Table(title=f"WeSpeaker r-vector Similarities to '{target_name}' Reference", show_lines=True, highlight=True)
+    log.info(
+        f"[green]✓ Identified '{target_name}' as diarization label → [bold]{best_match_label}[/] (WeSpeaker r-vector sim: {max_similarity_score:.4f})[/]"
+    )
+
+    sim_table = Table(
+        title=f"WeSpeaker r-vector Similarities to '{target_name}' Reference",
+        show_lines=True,
+        highlight=True,
+    )
     sim_table.add_column("Diarized Speaker Label", style="cyan", justify="center")
     sim_table.add_column("Similarity Score", style="magenta", justify="center")
-    for spk, score in sorted(speaker_similarities.items(), key=lambda item: item[1], reverse=True):
-        sim_table.add_row(spk, f"{score:.4f}", style="bold yellow on bright_black" if spk == best_match_label else "")
+    for spk, score in sorted(
+        speaker_similarities.items(), key=lambda item: item[1], reverse=True
+    ):
+        sim_table.add_row(
+            spk,
+            f"{score:.4f}",
+            style="bold yellow on bright_black" if spk == best_match_label else "",
+        )
     console.print(sim_table)
-    
+
     return best_match_label
 
 
-def merge_nearby_segments(segments_to_merge: list[Segment], max_allowed_gap: float = DEFAULT_MAX_MERGE_GAP) -> list[Segment]:
-    if not segments_to_merge: return []
+def merge_nearby_segments(
+    segments_to_merge: list[Segment], max_allowed_gap: float = DEFAULT_MAX_MERGE_GAP
+) -> list[Segment]:
+    if not segments_to_merge:
+        return []
     # Sort segments by start time
     sorted_segments = sorted(list(segments_to_merge), key=lambda s: s.start)
-    if not sorted_segments: return [] # Should not happen if segments_to_merge was not empty
-    
+    if not sorted_segments:
+        return []  # Should not happen if segments_to_merge was not empty
+
     merged_timeline = Timeline()
-    if not sorted_segments: return []
+    if not sorted_segments:
+        return []
 
     current_merged_segment = sorted_segments[0]
     for next_segment in sorted_segments[1:]:
         # If next_segment starts within max_allowed_gap of current_merged_segment's end
-        if (next_segment.start <= current_merged_segment.end + max_allowed_gap) and \
-           (next_segment.end > current_merged_segment.end): # And it extends the current segment
-            current_merged_segment = Segment(current_merged_segment.start, next_segment.end)
-        elif next_segment.start > current_merged_segment.end + max_allowed_gap: # Gap is too large
+        if (next_segment.start <= current_merged_segment.end + max_allowed_gap) and (
+            next_segment.end > current_merged_segment.end
+        ):  # And it extends the current segment
+            current_merged_segment = Segment(
+                current_merged_segment.start, next_segment.end
+            )
+        elif (
+            next_segment.start > current_merged_segment.end + max_allowed_gap
+        ):  # Gap is too large
             merged_timeline.add(current_merged_segment)
             current_merged_segment = next_segment
         # If next_segment is completely within current_merged_segment or starts before but ends earlier, it's usually handled by Timeline.support() or prior logic.
         # This simple merge focuses on extending or starting new.
-            
-    merged_timeline.add(current_merged_segment) # Add the last merged segment
-    return list(merged_timeline.support()) # .support() merges overlapping segments within the timeline
+
+    merged_timeline.add(current_merged_segment)  # Add the last merged segment
+    return list(
+        merged_timeline.support()
+    )  # .support() merges overlapping segments within the timeline
 
 
-def filter_segments_by_duration(segments_to_filter: list[Segment], min_req_duration: float = DEFAULT_MIN_SEGMENT_SEC) -> list[Segment]:
+def filter_segments_by_duration(
+    segments_to_filter: list[Segment], min_req_duration: float = DEFAULT_MIN_SEGMENT_SEC
+) -> list[Segment]:
     return [seg for seg in segments_to_filter if seg.duration >= min_req_duration]
 
 
-def check_voice_activity(audio_path: Path, min_speech_ratio: float = 0.6, vad_threshold: float = 0.5) -> bool:
+def check_voice_activity(
+    audio_path: Path, min_speech_ratio: float = 0.6, vad_threshold: float = 0.5
+) -> bool:
     """Checks voice activity in an audio file using Silero-VAD."""
-    try: 
-        y, sr = librosa.load(audio_path, sr=16000, mono=True) # Silero VAD expects 16kHz
-    except Exception as e: 
-        log.debug(f"VAD: Librosa load failed for {audio_path.name}: {e}. Assuming no voice activity."); return False
-    if len(y) == 0: 
-        log.debug(f"VAD: Audio file {audio_path.name} is empty. Assuming no voice activity."); return False
+    try:
+        y, sr = librosa.load(
+            audio_path, sr=16000, mono=True
+        )  # Silero VAD expects 16kHz
+    except Exception as e:
+        log.debug(
+            f"VAD: Librosa load failed for {audio_path.name}: {e}. Assuming no voice activity."
+        )
+        return False
+    if len(y) == 0:
+        log.debug(
+            f"VAD: Audio file {audio_path.name} is empty. Assuming no voice activity."
+        )
+        return False
     try:
         # Silero VAD model loading (cached by torch.hub)
-        vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, trust_repo=True, verbose=False, onnx=False)
-        (get_speech_timestamps, _, read_audio, _, _) = utils # read_audio is not used here as we load with librosa
-        vad_model.to(DEVICE) # Move model to appropriate device
-    except Exception as e: 
-        log.warning(f"VAD: Silero-VAD model loading failed: {e}. Skipping VAD for {audio_path.name}, assuming active speech."); return True
-        
+        vad_model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            trust_repo=True,
+            verbose=False,
+            onnx=False,
+        )
+        (get_speech_timestamps, _, read_audio, _, _) = (
+            utils  # read_audio is not used here as we load with librosa
+        )
+        vad_model.to(DEVICE)  # Move model to appropriate device
+    except Exception as e:
+        log.warning(
+            f"VAD: Silero-VAD model loading failed: {e}. Skipping VAD for {audio_path.name}, assuming active speech."
+        )
+        return True
+
     try:
         audio_tensor = torch.FloatTensor(y).to(DEVICE)
         # Silero VAD model expects sample rates 16000, 8000 or 48000Hz. We loaded at 16000Hz.
-        speech_timestamps = get_speech_timestamps(audio_tensor, vad_model, sampling_rate=16000, threshold=vad_threshold)
-        
-        speech_duration_samples = sum(d['end'] - d['start'] for d in speech_timestamps)
+        speech_timestamps = get_speech_timestamps(
+            audio_tensor, vad_model, sampling_rate=16000, threshold=vad_threshold
+        )
+
+        speech_duration_samples = sum(d["end"] - d["start"] for d in speech_timestamps)
         speech_duration_sec = speech_duration_samples / 16000
         total_duration_sec = len(y) / 16000
-        
-        ratio = speech_duration_sec / total_duration_sec if total_duration_sec > 0 else 0.0
-        log.debug(f"VAD for {audio_path.name}: Speech Ratio {ratio:.2f} (Speech: {speech_duration_sec:.2f}s / Total: {total_duration_sec:.2f}s)")
+
+        ratio = (
+            speech_duration_sec / total_duration_sec if total_duration_sec > 0 else 0.0
+        )
+        log.debug(
+            f"VAD for {audio_path.name}: Speech Ratio {ratio:.2f} (Speech: {speech_duration_sec:.2f}s / Total: {total_duration_sec:.2f}s)"
+        )
         return ratio >= min_speech_ratio
-    except Exception as e: 
-        log.warning(f"VAD: Error processing {audio_path.name} with Silero-VAD: {e}. Assuming active speech."); return True
+    except Exception as e:
+        log.warning(
+            f"VAD: Error processing {audio_path.name} with Silero-VAD: {e}. Assuming active speech."
+        )
+        return True
 
 
 def verify_speaker_segment(
-    segment_audio_path: Path,          # Path to the segment to verify (must be 16kHz mono for models)
-    reference_audio_path: Path,      # Path to the reference audio (must be 16kHz mono)
-    wespeaker_models: dict,          # Dict containing 'rvector' and 'gemini' WeSpeaker model instances
-    speechbrain_sb_model: 'SpeechBrainSpeakerRecognition', # SpeechBrain ECAPA-TDNN model instance
-    verification_strategy: str = "weighted_average" # or "sequential_gauntlet" (not fully implemented)
+    segment_audio_path: Path,  # Path to the segment to verify (must be 16kHz mono for models)
+    reference_audio_path: Path,  # Path to the reference audio (must be 16kHz mono)
+    wespeaker_models: dict,  # Dict containing 'rvector' and 'gemini' WeSpeaker model instances
+    speechbrain_sb_model,  # SpeechBrain ECAPA-TDNN model instance
+    verification_strategy: str = "weighted_average",  # or "sequential_gauntlet" (not fully implemented)
 ) -> tuple[float, dict]:
     """
     Performs multi-stage speaker verification on an audio segment.
     Ensures input paths (segment_audio_path, reference_audio_path) are 16kHz mono.
     """
     scores = {
-        "wespeaker_rvector": 0.0, 
-        "speechbrain_ecapa": 0.0, 
+        "wespeaker_rvector": 0.0,
+        "speechbrain_ecapa": 0.0,
         "wespeaker_gemini": 0.0,
-        "voice_activity_factor": 0.1 # Default to low if VAD fails or no activity
+        "voice_activity_factor": 0.1,  # Default to low if VAD fails or no activity
     }
     seg_name = segment_audio_path.name
 
@@ -990,458 +1476,830 @@ def verify_speaker_segment(
             ref_emb = ws_rvector_model.extract_embedding(str(reference_audio_path))
             seg_emb = ws_rvector_model.extract_embedding(str(segment_audio_path))
             scores["wespeaker_rvector"] = cos(ref_emb, seg_emb)
-            log.debug(f"WeSpeaker r-vector score for {seg_name}: {scores['wespeaker_rvector']:.4f}")
+            log.debug(
+                f"WeSpeaker r-vector score for {seg_name}: {scores['wespeaker_rvector']:.4f}"
+            )
         except Exception as e:
             log.warning(f"WeSpeaker r-vector verification failed for {seg_name}: {e}")
 
     # --- Stage 2: SpeechBrain ECAPA-TDNN ---
-    if speechbrain_sb_model and HAVE_SPEECHBRAIN: # HAVE_SPEECHBRAIN check is redundant if model is passed
+    if (
+        speechbrain_sb_model and HAVE_SPEECHBRAIN
+    ):  # HAVE_SPEECHBRAIN check is redundant if model is passed
         try:
             # SpeechBrain's verify_files loads audio and handles internal resampling if needed.
             # Assumes reference_audio_path and segment_audio_path are valid paths.
-            ref_path_str = str(reference_audio_path.resolve()).replace('\\', '/')
-            seg_path_str = str(segment_audio_path.resolve()).replace('\\', '/')
+            ref_path_str = str(reference_audio_path.resolve()).replace("\\", "/")
+            seg_path_str = str(segment_audio_path.resolve()).replace("\\", "/")
             score_tensor, _ = speechbrain_sb_model.verify_files(
-                ref_path_str,
-                seg_path_str
+                ref_path_str, seg_path_str
             )
             scores["speechbrain_ecapa"] = score_tensor.item()
-            log.debug(f"SpeechBrain ECAPA-TDNN score for {seg_name}: {scores['speechbrain_ecapa']:.4f}")
+            log.debug(
+                f"SpeechBrain ECAPA-TDNN score for {seg_name}: {scores['speechbrain_ecapa']:.4f}"
+            )
         except Exception as e:
-            log.warning(f"SpeechBrain ECAPA-TDNN verification failed for {seg_name}: {e}")
+            log.warning(
+                f"SpeechBrain ECAPA-TDNN verification failed for {seg_name}: {e}"
+            )
 
     # --- Stage 3: WeSpeaker Golden Gemini DF-ResNet ---
     if wespeaker_models and wespeaker_models.get("gemini"):
         try:
             ws_gemini_model = wespeaker_models["gemini"]
-            ref_emb_gemini = ws_gemini_model.extract_embedding(str(reference_audio_path))
+            ref_emb_gemini = ws_gemini_model.extract_embedding(
+                str(reference_audio_path)
+            )
             seg_emb_gemini = ws_gemini_model.extract_embedding(str(segment_audio_path))
             scores["wespeaker_gemini"] = cos(ref_emb_gemini, seg_emb_gemini)
-            log.debug(f"WeSpeaker Gemini score for {seg_name}: {scores['wespeaker_gemini']:.4f}")
+            log.debug(
+                f"WeSpeaker Gemini score for {seg_name}: {scores['wespeaker_gemini']:.4f}"
+            )
         except Exception as e:
             log.warning(f"WeSpeaker Gemini verification failed for {seg_name}: {e}")
-    
+
     # --- Voice Activity Check ---
     # VAD runs on segment_audio_path, expects 16kHz mono (librosa handles loading)
-    scores["voice_activity_factor"] = 1.0 if check_voice_activity(segment_audio_path) else 0.1 # Multiplier
+    scores["voice_activity_factor"] = (
+        1.0 if check_voice_activity(segment_audio_path) else 0.1
+    )  # Multiplier
 
     # --- Combine Scores ---
     # Default: Weighted average. Weights can be tuned.
     # Example weights: r-vector (0.4), ECAPA (0.3), Gemini (0.3)
     # This is a simple combination; more sophisticated fusion could be used.
     # For sequential gauntlet: would involve if score1 > T1 and score2 > T2 ...
-    
+
     final_score = 0.0
     if verification_strategy == "weighted_average":
-        w_rvec = 0.4; w_ecapa = 0.3; w_gemini = 0.3
-        avg_score = (scores["wespeaker_rvector"] * w_rvec +
-                     scores["speechbrain_ecapa"] * w_ecapa +
-                     scores["wespeaker_gemini"] * w_gemini)
+        w_rvec = 0.4
+        w_ecapa = 0.3
+        w_gemini = 0.3
+        avg_score = (
+            scores["wespeaker_rvector"] * w_rvec
+            + scores["speechbrain_ecapa"] * w_ecapa
+            + scores["wespeaker_gemini"] * w_gemini
+        )
         final_score = avg_score * scores["voice_activity_factor"]
     # Add other strategies if needed
-    else: # Fallback to simple average if strategy not recognized
-        valid_scores = [s for k, s in scores.items() if k != "voice_activity_factor" and s > 0.0] # Use only successfully computed scores
+    else:  # Fallback to simple average if strategy not recognized
+        valid_scores = [
+            s for k, s in scores.items() if k != "voice_activity_factor" and s > 0.0
+        ]  # Use only successfully computed scores
         if valid_scores:
             avg_score = sum(valid_scores) / len(valid_scores)
             final_score = avg_score * scores["voice_activity_factor"]
-        else: # No verification model scores available
-            final_score = 0.0 # Effectively reject
+        else:  # No verification model scores available
+            final_score = 0.0  # Effectively reject
 
-    log.debug(f"Final combined score for {seg_name}: {final_score:.4f}, Details: {scores}")
+    log.debug(
+        f"Final combined score for {seg_name}: {final_score:.4f}, Details: {scores}"
+    )
     return final_score, scores
 
 
-def get_target_solo_timeline(
-    diarization_annotation: Annotation, identified_target_label: str, overlap_timeline: Timeline
-) -> Timeline:
-    """Extracts timeline for the target speaker EXCLUDING overlapped regions."""
-    if not identified_target_label or identified_target_label not in diarization_annotation.labels():
-        log.warning(f"Target label '{identified_target_label}' not in diarization. Cannot extract solo timeline.")
-        return Timeline()
-    
-    target_speaker_timeline = diarization_annotation.label_timeline(identified_target_label)
-    if not target_speaker_timeline:
-        log.info(f"No speech segments for target '{identified_target_label}' in diarization.")
-        return Timeline()
-
-    # .support() merges overlapping segments within the target_speaker_timeline itself.
-    # .extrude() subtracts the overlap_timeline from the target_speaker_timeline.
-    final_solo_timeline = target_speaker_timeline.support().extrude(overlap_timeline.support())
-    return final_solo_timeline
 
 
-def slice_and_verify_target_solo_segments(
-    diarization_annotation: Annotation, identified_target_label: str, overlap_timeline: Timeline,
-    source_audio_file: Path,          # Audio to slice from (e.g., bandit output or original)
-    processed_reference_file: Path, # 16kHz mono reference for verification
+
+def slice_classify_clean_and_verify_target_solo_segments(
+    diarization_result: Annotation,
+    target_speaker_label: str,
+    original_audio_file: Path,
+    output_dir_target_speaker: Path,
+    tmp_dir_segments: Path,
+    reference_audio_path_processed: Path,    wespeaker_models: dict,
+    speechbrain_sb_model,
+    whisper_model_name: str,
     target_name: str,
-    output_segments_base_dir: Path,   # Base dir, subdirs "verified" and "rejected" will be made here
-    tmp_dir: Path,
+    min_segment_duration: float,
+    max_merge_gap: float,
     verification_threshold: float,
-    min_segment_duration: float, max_merge_gap_val: float,
-    wespeaker_models_dict: dict,      # Initialized WeSpeaker models
-    speechbrain_sb_model_inst: 'SpeechBrainSpeakerRecognition', # Initialized SpeechBrain model
-    output_sample_rate: int = 44100,  # Target SR for FINAL segments (TTS data)
-    output_channels: int = 1
-) -> tuple[list[Path], list[Path]]:
-    log.info(f"Refining and processing SOLO segments for '{target_name}' (label: {identified_target_label}).")
+    vad_verification: bool,
+    transcribe_verified_segments: bool,
+    classify_and_clean: bool,
+    noise_classifier_model_id: str | None,    audio_separator_model: object,
+    vocals_file: Path | None,
+    noise_classification_confidence_threshold: float = 0.3,skip_verification_if_cleaned: bool = False,
+    whisper_model_instance = None,
+    language: str = "en",
+    max_segment_duration: float = 30.0,
+) -> tuple[list[Path], list[dict]]:
+    """
+    Slices segments for the target speaker, optionally classifies/cleans them,
+    verifies them, and optionally transcribes them.
+    Manages VRAM by loading/unloading noise classifier when classify_and_clean is active.
     
-    target_solo_speech_timeline = get_target_solo_timeline(diarization_annotation, identified_target_label, overlap_timeline)
-    if not target_solo_speech_timeline:
-        log.warning(f"No solo speech for '{target_name}' after excluding overlaps. Skipping extraction.")
-        return [], []
-    log.info(f"Initial solo timeline for '{target_name}' (post-overlap subtraction) has {len(list(target_solo_speech_timeline))} sub-segments, duration: {format_duration(target_solo_speech_timeline.duration())}.")
+    Args:
+        ...existing args...
+        whisper_model_instance: Pre-loaded Whisper model instance for efficient transcription
+        language: Language code for transcription    """
+    log.info(
+        f"Processing segments for target speaker: '{target_name}' (Label: {target_speaker_label})"
+    )
+    ensure_dir_exists(tmp_dir_segments)
+    ensure_dir_exists(output_dir_target_speaker)
 
-    merged_target_solo_segments = merge_nearby_segments(list(target_solo_speech_timeline), max_merge_gap_val)
-    log.info(f"After merging nearby solo sub-segments (gap <= {max_merge_gap_val}s): {len(merged_target_solo_segments)} segments.")
-    duration_filtered_target_solo_segments = filter_segments_by_duration(merged_target_solo_segments, min_segment_duration)
-    log.info(f"After duration filtering (>= {min_segment_duration}s): {len(duration_filtered_target_solo_segments)} final solo segments to process.")
-    
-    if not duration_filtered_target_solo_segments:
-        log.warning(f"No solo segments for '{target_name}' after merging/duration filtering. Skipping.")
-        return [], []
+    verified_segment_audio_files = []
+    all_segment_details = []
 
-    # Setup output directories for verified and rejected segments
-    safe_target_name_prefix = safe_filename(target_name)
-    solo_segments_verified_dir = output_segments_base_dir / f"{safe_target_name_prefix}_solo_verified"
-    solo_segments_rejected_dir = output_segments_base_dir / f"{safe_target_name_prefix}_solo_rejected_for_review"
-    ensure_dir_exists(solo_segments_verified_dir)
-    ensure_dir_exists(solo_segments_rejected_dir)
-
-    # Create TWO temporary directories - one for verification, one for high-quality
-    tmp_pre_verification_segments_dir = tmp_dir / f"__tmp_segments_for_verification_{safe_target_name_prefix}"
-    tmp_high_quality_segments_dir = tmp_dir / f"__tmp_segments_high_quality_{safe_target_name_prefix}"
-    ensure_dir_exists(tmp_pre_verification_segments_dir)
-    ensure_dir_exists(tmp_high_quality_segments_dir)
-    
-    # Clean up previous temp files if any
-    for f in tmp_pre_verification_segments_dir.glob("*.wav"): f.unlink()
-    for f in tmp_high_quality_segments_dir.glob("*.wav"): f.unlink()
-
-    # Slice segments - create both 16kHz for verification AND high-quality for final output
-    log.info(f"Slicing {len(duration_filtered_target_solo_segments)} candidate solo segments from '{source_audio_file.name}'...")
-    temp_segments_for_verification = []
-    high_quality_segments_map = {}  # Maps verification path to high-quality path
-    
-    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb_slice:
-        task_slice = pb_slice.add_task("Slicing for verification...", total=len(duration_filtered_target_solo_segments))
-        for i, seg_obj in enumerate(duration_filtered_target_solo_segments):
-            s_str = f"{seg_obj.start:.3f}".replace('.', 'p')
-            e_str = f"{seg_obj.end:.3f}".replace('.', 'p')
-            base_seg_name = f"solo_temp_verif_{i:04d}_{s_str}s_to_{e_str}s"
-            
-            # Create 16kHz version for verification
-            tmp_verif_seg_path = tmp_pre_verification_segments_dir / f"{base_seg_name}.wav"
-            # Create high-quality version for final output
-            tmp_hq_seg_path = tmp_high_quality_segments_dir / f"{base_seg_name}_hq.wav"
-            
-            try:
-                # Slice to 16kHz mono for verification models
-                ff_slice(source_audio_file, tmp_verif_seg_path, seg_obj.start, seg_obj.end,
-                         target_sr=16000, target_ac=1)
-                # Slice to target quality for final output (preserves full frequency range)
-                ff_slice(source_audio_file, tmp_hq_seg_path, seg_obj.start, seg_obj.end,
-                         target_sr=output_sample_rate, target_ac=output_channels)
-                
-                if tmp_verif_seg_path.exists() and tmp_verif_seg_path.stat().st_size > 0:
-                    temp_segments_for_verification.append(tmp_verif_seg_path)
-                    high_quality_segments_map[str(tmp_verif_seg_path)] = tmp_hq_seg_path
-                else:
-                    log.warning(f"Failed to create/empty slice for verification: {tmp_verif_seg_path.name}")
-            except Exception as e_slice:
-                log.error(f"Failed to slice {tmp_verif_seg_path.name} for verification: {e_slice}. Skipping.")
-            pb_slice.update(task_slice, advance=1)
-
-    if not temp_segments_for_verification:
-        log.warning("No solo segments successfully sliced for verification. Skipping verification step.")
-        return [], []
-
-    # Verify the 16kHz mono temporary segments
-    segment_verification_scores_map = {}
-    log.info(f"Verifying identity in {len(temp_segments_for_verification)} sliced 16kHz mono solo segments...")
-    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb_verify:
-        task_verify = pb_verify.add_task(f"Verifying '{target_name}' (solo)...", total=len(temp_segments_for_verification))
-        for temp_16k_path in temp_segments_for_verification:
-            final_score, _raw_scores = verify_speaker_segment(
-                temp_16k_path, processed_reference_file, 
-                wespeaker_models_dict, speechbrain_sb_model_inst
+    if classify_and_clean:
+        audio_source_for_slicing = original_audio_file
+        log.info(
+            f"Classify & Clean mode: Segments will be sliced from original audio: {original_audio_file.name}"        )
+        if not audio_separator_model:
+            log.warning(
+                "Classify & Clean mode is active, but no Audio Separator model provided. Noisy segments cannot be cleaned."
             )
-            segment_verification_scores_map[str(temp_16k_path)] = final_score
-            pb_verify.update(task_verify, advance=1)
+    else:
+        if vocals_file and vocals_file.exists():
+            audio_source_for_slicing = vocals_file
+            log.info(
+                f"Standard mode: Segments will be sliced from Audio Separator vocals: {vocals_file.name}"
+            )
+        else:
+            audio_source_for_slicing = original_audio_file
+            log.info(
+                f"Standard mode: No Audio Separator vocals file. Segments will be sliced from original audio: {original_audio_file.name}"
+            )
 
-    if DEVICE.type == "cuda": torch.cuda.empty_cache() # Clear VRAM after model use
+    target_speaker_segments = list(
+        diarization_result.label_timeline(target_speaker_label)
+    )
+    if not target_speaker_segments:
+        log.warning(
+            f"No diarized segments found for target speaker '{target_name}' ({target_speaker_label})."
+        )
+        return [], []
 
-    # Plot scores (using temp path names, but will be mapped to final names later)
-    plot_scores_display_dict = {Path(k).name: v for k, v in segment_verification_scores_map.items()}
-    num_accepted, num_rejected = plot_verification_scores(
-        plot_scores_display_dict, verification_threshold, 
-        output_dir=output_segments_base_dir.parent / "visualizations", # Place plot in main visualizations dir
-        target_name=target_name, 
-        plot_title_prefix=f"{safe_target_name_prefix}_SOLO_Verification_Scores"
+    merged_segments = merge_nearby_segments(target_speaker_segments, max_merge_gap)
+    final_segments_to_process = filter_segments_by_duration(
+        merged_segments, min_segment_duration
+    )
+    log.info(
+        f"Found {len(target_speaker_segments)} raw segments, merged to {len(merged_segments)}, filtered to {len(final_segments_to_process)} segments for '{target_name}'."
     )
 
-    # Finalize: Use HIGH-QUALITY segments for output based on verification scores
-    final_verified_solo_paths = []
-    final_rejected_solo_paths = []
-    log.info(f"Finalizing {num_accepted} verified solo segments (threshold: {verification_threshold:.3f}). Rejected: {num_rejected}.")
-    log.info(f"Verified segments will be saved at {output_sample_rate}Hz, {output_channels}ch.")
+    if not final_segments_to_process:
+        log.warning(
+            f"No segments remain for '{target_name}' after merging and duration filtering."
+        )
+        return [], []
 
-    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb_finalize:
-        task_finalize = pb_finalize.add_task("Finalizing solo segments...", total=len(temp_segments_for_verification))
-        for temp_16k_path_str, score in segment_verification_scores_map.items():
-            temp_16k_path = Path(temp_16k_path_str)
-            if not temp_16k_path.exists(): continue
+    noise_classifier_instance = None
+    if classify_and_clean and noise_classifier_model_id and HAVE_TRANSFORMERS:
+        noise_classifier_instance = NoiseClassifier(
+            model_id=noise_classifier_model_id, device_to_use=DEVICE
+        )
+    elif classify_and_clean and not HAVE_TRANSFORMERS:
+        log.warning(
+            "Classify & Clean mode is active, but Transformers library is not available. Noise classification will be skipped."
+        )
+    elif classify_and_clean and not noise_classifier_model_id:
+        log.warning(
+            "Classify & Clean mode is active, but no noise_classifier_model_id provided. Noise classification will be skipped."
+        )
 
-            # Get the corresponding high-quality segment
-            hq_seg_path = high_quality_segments_map.get(temp_16k_path_str)
-            if not hq_seg_path or not hq_seg_path.exists():
-                log.warning(f"High-quality version not found for {temp_16k_path.name}")
-                pb_finalize.update(task_finalize, advance=1)
+    for segment_idx, segment in enumerate(final_segments_to_process):
+        segment_start_time = segment.start
+        segment_end_time = segment.end
+        segment_duration = segment.duration
+        
+        segment_base_name = f"{safe_filename(target_name)}_seg{segment_idx:04d}_{segment_start_time:.2f}s_{segment_end_time:.2f}s"
+        log.info(
+            f"Processing segment {segment_idx + 1}/{len(final_segments_to_process)} for '{target_name}': {segment_base_name} ({segment_duration:.2f}s long)"
+        )
+
+        if classify_and_clean and noise_classifier_instance:
+            # Get chunks for classification
+            temp_segment_base_path = tmp_dir_segments / f"{segment_base_name}_for_classify_mono.wav"
+            
+            classification_chunks = ff_slice_smart(
+                original_audio_file,
+                temp_segment_base_path,
+                segment_start_time,
+                segment_end_time,
+                target_sr=16000,
+                target_ac=1,
+                max_segment_duration=max_segment_duration,
+                return_chunks=True
+            )
+            
+            # Handle both single file and multiple chunks
+            if isinstance(classification_chunks, list):
+                chunk_paths = classification_chunks
+            else:
+                chunk_paths = [classification_chunks]
+                
+            log.info(f"Processing {len(chunk_paths)} chunks for segment {segment_idx+1}")
+              # Process each chunk separately
+            chunk_results = []
+            for chunk_idx, chunk_path in enumerate(chunk_paths):
+                if not chunk_path or not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                    if chunk_path:
+                        log.warning(f"Chunk {chunk_idx+1} is missing or empty: {chunk_path.name}")
+                    else:
+                        log.warning(f"Chunk {chunk_idx+1} is None or failed to create")
+                    continue
+                
+                chunk_classification = noise_classifier_instance.classify(
+                    str(chunk_path),
+                    confidence_threshold=noise_classification_confidence_threshold,
+                )
+                
+                log.info(f"Chunk {chunk_idx+1}/{len(chunk_paths)} classified as: {chunk_classification.upper()}")                # Process this chunk based on classification
+                chunk_audio_path_for_verification = None
+                chunk_cleaned_by_audio_separator = False
+                
+                if chunk_classification == "noisy" and audio_separator_model:
+                    log.info(f"Chunk {chunk_idx+1} is NOISY. Attempting Audio Separator cleaning.")
+                    audio_separator_output_dir_for_chunk = tmp_dir_segments / f"audio_separator_cleaned_{segment_idx}_chunk{chunk_idx+1}"
+                    ensure_dir_exists(audio_separator_output_dir_for_chunk)
+                    
+                    cleaned_chunk_path, _ = run_audio_separator_vocal_separation(
+                        input_audio_file=chunk_path,
+                        audio_separator=audio_separator_model,
+                        vocals_output_dir=audio_separator_output_dir_for_chunk,
+                        instrumental_output_dir=None,  # We don't need instrumental for cleaning
+                    )
+                    
+                    if cleaned_chunk_path and cleaned_chunk_path.exists():
+                        log.info(f"Audio Separator cleaning successful for chunk {chunk_idx+1}")
+                        chunk_audio_path_for_verification = tmp_dir_segments / f"{segment_base_name}_chunk{chunk_idx+1:02d}_cleaned_mono.wav"
+                        # Copy cleaned chunk to verification path with proper format
+                        shutil.copy(str(cleaned_chunk_path), str(chunk_audio_path_for_verification))
+                        chunk_cleaned_by_audio_separator = True
+                        
+                        # Clean up the audio separator output directory to save space
+                        if audio_separator_output_dir_for_chunk.exists():
+                            shutil.rmtree(audio_separator_output_dir_for_chunk, ignore_errors=True)
+                    else:
+                        log.warning(f"Audio Separator cleaning failed for chunk {chunk_idx+1}. Using original.")
+                        chunk_audio_path_for_verification = chunk_path
+                        
+                elif chunk_classification == "noisy" and not audio_separator_model:
+                    log.warning(f"Chunk {chunk_idx+1} is NOISY, but no Audio Separator model provided.")
+                    chunk_audio_path_for_verification = chunk_path
+                else:  # Clean or Unknown
+                    log.info(f"Chunk {chunk_idx+1} is CLEAN or classification UNKNOWN.")
+                    chunk_audio_path_for_verification = chunk_path
+                
+                chunk_results.append({
+                    'chunk_idx': chunk_idx,
+                    'chunk_path': chunk_path,
+                    'verification_path': chunk_audio_path_for_verification,
+                    'classification': chunk_classification,
+                    'cleaned_by_audio_separator': chunk_cleaned_by_audio_separator                })
+            # We'll process verification for each chunk later in the verification section
+
+        else:  # Not classify_and_clean, or no classifier instance
+            segment_base_path = tmp_dir_segments / f"{segment_base_name}_std_mono.wav"
+            
+            # Use ff_slice_smart to get either a single file or multiple chunks
+            slice_result = ff_slice_smart(
+                audio_source_for_slicing,
+                segment_base_path,
+                segment_start_time,
+                segment_end_time,
+                target_sr=16000,
+                target_ac=1,
+                max_segment_duration=max_segment_duration,
+                return_chunks=True
+            )
+            
+            # Handle both single file and multiple chunks  
+            if isinstance(slice_result, list):
+                chunk_paths = slice_result
+            else:
+                chunk_paths = [slice_result]
+                
+            log.info(f"Processing {len(chunk_paths)} chunks for segment {segment_idx+1}")
+            
+            # For standard flow, create chunk results without classification
+            chunk_results = []
+            for chunk_idx, chunk_path in enumerate(chunk_paths):
+                if chunk_path.exists() and chunk_path.stat().st_size > 0:
+                    chunk_results.append({
+                        'chunk_idx': chunk_idx,
+                        'chunk_path': chunk_path,
+                        'verification_path': chunk_path,
+                        'classification': 'N/A (standard_flow)',
+                        'cleaned_by_audio_separator': False
+                    })
+                else:
+                    if chunk_path:
+                        log.warning(f"Chunk {chunk_idx+1} is missing or empty: {chunk_path.name}")
+                    else:
+                        log.warning(f"Chunk {chunk_idx+1} is None or failed to create")
+            
+        # --- Verification (Process each chunk separately) ---
+        # Now we have chunk_results list with chunks to process
+        verified_chunks = []
+        
+        for chunk_result in chunk_results:
+            chunk_idx = chunk_result['chunk_idx']
+            chunk_path = chunk_result['verification_path']
+            chunk_classification = chunk_result['classification']
+            chunk_cleaned_by_audio_separator = chunk_result['cleaned_by_audio_separator']
+            
+            if not chunk_path or not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                log.warning(f"Chunk {chunk_idx+1} audio for verification is missing or empty. Skipping.")
                 continue
-
-            # Construct final segment name based on original segment times
-            final_seg_name_base = temp_16k_path.stem.replace("solo_temp_verif", f"{safe_target_name_prefix}_solo_final")
             
-            if score >= verification_threshold: # ACCEPTED
-                final_seg_path = solo_segments_verified_dir / f"{final_seg_name_base}.wav"
-                try:
-                    # Copy the high-quality version (preserves full frequency content)
-                    shutil.copy(hq_seg_path, final_seg_path)
-                    if final_seg_path.exists() and final_seg_path.stat().st_size > 0:
-                        final_verified_solo_paths.append(final_seg_path)
-                    else: 
-                        log.warning(f"Failed to create final verified segment: {final_seg_path.name}")
-                except Exception as e_ff_final:
-                    log.error(f"Error finalizing accepted segment {final_seg_path.name}: {e_ff_final}")
-            else: # REJECTED
-                rejected_filename = f"{final_seg_name_base}_score_{score:.3f}.wav"
-                rejected_seg_path = solo_segments_rejected_dir / rejected_filename
-                try:
-                    # Copy the high-quality version for rejected segments too
-                    shutil.copy(hq_seg_path, rejected_seg_path)
-                    if rejected_seg_path.exists() and rejected_seg_path.stat().st_size > 0:
-                        final_rejected_solo_paths.append(rejected_seg_path)
-                    else: 
-                        log.warning(f"Failed to create final rejected segment: {rejected_seg_path.name}")
-                except Exception as e_ff_final_rej:
-                    log.error(f"Error finalizing rejected segment {rejected_seg_path.name}: {e_ff_final_rej}")
+            # VAD check for this chunk
+            if vad_verification:
+                is_active_speech = check_voice_activity(chunk_path)
+                if not is_active_speech:
+                    log.info(f"Chunk {chunk_idx+1} failed VAD check (low voice activity). Skipping verification.")
+                    continue
             
-            pb_finalize.update(task_finalize, advance=1)
-            temp_16k_path.unlink(missing_ok=True) # Clean up temp 16k file
-            hq_seg_path.unlink(missing_ok=True) # Clean up temp HQ file
+            # Verify this individual chunk
+            log.info(f"Verifying chunk {chunk_idx+1}: {chunk_path.name} against reference")
+            
+            final_score, all_scores = verify_speaker_segment(
+                segment_audio_path=chunk_path,
+                reference_audio_path=reference_audio_path_processed,
+                wespeaker_models=wespeaker_models,
+                speechbrain_sb_model=speechbrain_sb_model,
+            )
+            
+            is_verified_chunk = final_score >= verification_threshold
+            log.info(f"Chunk {chunk_idx+1} verification score: {final_score:.4f} (Threshold: {verification_threshold}) -> Verified: {is_verified_chunk}")
+            
+            if is_verified_chunk:                # Create verified chunk filename
+                final_verified_chunk_filename = f"{segment_base_name}_chunk{chunk_idx+1:02d}_verified_score{final_score:.2f}.wav"
+                final_verified_chunk_path = output_dir_target_speaker / final_verified_chunk_filename
+                
+                try:
+                    shutil.copy(str(chunk_path), str(final_verified_chunk_path))
+                    log.info(f"Saved verified chunk to: {final_verified_chunk_path.name}")
+                    verified_chunks.append(final_verified_chunk_path)
+                    
+                    # Note: Transcription will be handled in Stage 7 (batch processing)
+                    
+                except Exception as e_copy:
+                    log.error(f"Error copying verified chunk {chunk_idx+1}: {e_copy}")
+            
+            # Record details for this chunk
+            chunk_details = {
+                "index": f"{segment_idx}.{chunk_idx}",
+                "start": segment_start_time,
+                "end": segment_end_time,
+                "duration": segment_duration,
+                "chunk_idx": chunk_idx,
+                "classification": chunk_classification,
+                "cleaned_by_audio_separator": chunk_cleaned_by_audio_separator,
+                "verified": is_verified_chunk,
+                "verification_score": final_score,
+                "reason": "Verified" if is_verified_chunk else "Failed verification score",
+                "transcript": None,
+                "output_file_path": str(final_verified_chunk_path) if is_verified_chunk else None,
+            }
+            all_segment_details.append(chunk_details)
+          # Add verified chunks to the main list
+        verified_segment_audio_files.extend(verified_chunks)
+        
+        log.info(f"Processed {len(chunk_results)} chunks for segment {segment_idx+1}. {len(verified_chunks)} chunks verified.")
 
-    # Clean up temporary directories
-    if tmp_pre_verification_segments_dir.exists():
-        try: 
-            shutil.rmtree(tmp_pre_verification_segments_dir)
-        except OSError as e_rm_tmp: 
-            log.warning(f"Could not remove temp verification segments dir {tmp_pre_verification_segments_dir}: {e_rm_tmp}")
+        # Skip the old single-segment verification logic since we processed chunks
+        continue    # After loop, if noise classifier was used and potentially still loaded, unload it.
+    if noise_classifier_instance:
+        noise_classifier_instance.unload_model()
+
+    log.info(
+        f"Finished processing {len(final_segments_to_process)} segments for '{target_name}'. Found {len(verified_segment_audio_files)} verified segments."
+    )
+    return verified_segment_audio_files, all_segment_details
+
+
+def transcribe_audio(audio_path: Path, model_name: str, tmp_dir: Path, 
+                    whisper_model_instance=None, nemo_model_instance=None, 
+                    asr_engine: str = "whisper", language: str = "en") -> str | None:
+    """
+    Transcribes a given audio file using either Whisper or NeMo ASR model.
+    Saves the transcript to a text file and returns the transcript.
     
-    if tmp_high_quality_segments_dir.exists():
-        try: 
-            shutil.rmtree(tmp_high_quality_segments_dir)
-        except OSError as e_rm_tmp_hq: 
-            log.warning(f"Could not remove temp high-quality segments dir {tmp_high_quality_segments_dir}: {e_rm_tmp_hq}")
+    Args:
+        audio_path: Path to audio file to transcribe
+        model_name: Name of ASR model (used only if model_instance is None)
+        tmp_dir: Directory to save transcript file
+        whisper_model_instance: Pre-loaded Whisper model instance (preferred for performance)
+        nemo_model_instance: Pre-loaded NeMo ASR model instance (preferred for performance)
+        asr_engine: ASR engine to use ("whisper" or "nemo")
+        language: Language for transcription (used by Whisper)
+    """
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        log.warning(
+            f"Audio file for transcription not found or empty: {audio_path.name}"
+        )
+        return None
+
+    log.info(
+        f"Transcribing audio: {audio_path.name} using {asr_engine.upper()} model: {model_name}..."
+    )
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Ensure temporary directory for transcription files
+    ensure_dir_exists(tmp_dir)
+
+    # Transcription result
+    transcript_text = ""    # Perform transcription based on selected engine
+    if asr_engine.lower() == "nemo" and HAVE_NEMO_ASR:
+        # Use NeMo ASR
+        model = nemo_model_instance
+        if model is None:
+            try:
+                log.info(f"Loading NeMo ASR model '{model_name}'...")
+                model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
+                if DEVICE.type == "cuda":
+                    model = model.to(DEVICE)
+                log.info(f"NeMo ASR model '{model_name}' loaded.")
+            except Exception as e:
+                log.error(f"Failed to load NeMo ASR model '{model_name}': {e}")
+                return None
+        else:
+            log.debug(f"Using pre-loaded NeMo ASR model for {audio_path.name}")
+
+        try:
+            # NeMo ASR transcription - ensure mono audio at 16kHz
+            try:
+                import librosa
+                import soundfile as sf
+                # Load audio and ensure it's mono at 16kHz
+                audio_data, sr = librosa.load(str(audio_path), sr=16000, mono=True)
+                # Create temporary mono file if conversion was needed
+                temp_mono_file = tmp_dir / f"temp_mono_{audio_path.name}"
+                sf.write(str(temp_mono_file), audio_data, sr)
+                output = model.transcribe([str(temp_mono_file)])
+                # Clean up temporary file
+                temp_mono_file.unlink()
+            except Exception as e_mono:
+                log.warning(f"Failed to preprocess audio for NeMo: {e_mono}, trying direct transcription")
+                output = model.transcribe([str(audio_path)])
+            
+            if output and len(output) > 0:
+                transcript_text = output[0].text.strip() if hasattr(output[0], 'text') else str(output[0]).strip()
+            else:
+                transcript_text = ""
+            log.info(f"NeMo ASR transcription successful for {audio_path.name}.")
+        except Exception as e_transcribe:
+            log.error(f"Error transcribing {audio_path.name} with NeMo ASR: {e_transcribe}")
+            transcript_text = "[NeMo Transcription Error]"
     
-    log.info(f"[green]✓ Extracted and verified {len(final_verified_solo_paths)} solo segments for '{target_name}'.[/]")
-    if num_rejected > 0:
-        log.info(f"  Rejected {num_rejected} segments saved for review in: {solo_segments_rejected_dir.resolve()}")
-    
-    return final_verified_solo_paths, final_rejected_solo_paths
+    else:
+        # Use Whisper ASR (default)
+        if asr_engine.lower() == "nemo" and not HAVE_NEMO_ASR:
+            log.warning("NeMo ASR requested but not available. Falling back to Whisper.")
+        
+        model = whisper_model_instance
+        if model is None:
+            try:
+                log.info(f"Loading Whisper model '{model_name}'...")
+                model = whisper.load_model(model_name, device=DEVICE)
+                log.info(f"Whisper model '{model_name}' loaded.")
+            except Exception as e:
+                log.error(f"Failed to load Whisper model '{model_name}': {e}")
+                return None
+        else:
+            log.debug(f"Using pre-loaded Whisper model for {audio_path.name}")
+
+        try:
+            transcribe_kwargs = {"fp16": DEVICE.type == "cuda"}
+            if language and language != "auto":
+                transcribe_kwargs["language"] = language
+            
+            result = model.transcribe(str(audio_path), **transcribe_kwargs)
+            transcript_text = result["text"].strip() if "text" in result else ""
+            log.info(f"Whisper transcription successful for {audio_path.name}.")
+        except Exception as e_transcribe:
+            log.error(f"Error transcribing {audio_path.name} with Whisper: {e_transcribe}")
+            transcript_text = "[Whisper Transcription Error]"    # Save transcript to a text file
+    try:
+        # Output TXT file path
+        txt_file_path = tmp_dir / f"{safe_filename(audio_path.stem)}_transcript.txt"
+        txt_file_path.write_text(transcript_text, encoding="utf-8")
+        log.info(f"Transcript saved to: {txt_file_path.name}")
+    except Exception as e_save:
+        log.error(f"Failed to save transcript for {audio_path.name}: {e_save}")
+
+    return transcript_text
 
 
 def transcribe_segments(
-    segment_paths: list[Path], 
-    output_transcripts_main_dir: Path, # e.g., .../transcripts_solo_verified/
+    segment_paths: list[Path],
+    output_dir: Path,
     target_name: str,
-    segment_type_tag: str, # "solo_verified" or "solo_rejected"
-    whisper_model_name: str = "large-v3", 
+    segment_label: str,
+    model_name: str,
+    asr_engine: str = "whisper",
     language: str = "en",
-    whisper_model_instance = None # Pass loaded model
-) -> None:
+    whisper_model_instance = None,
+    nemo_model_instance = None,
+) -> dict[Path, str]:
     """
-    Transcribes segments using Whisper and saves consolidated CSV and TXT transcripts.
+    Transcribes multiple audio segments using either Whisper or NeMo ASR model.
+    Returns a dictionary mapping segment paths to their transcripts.
+    
+    Args:
+        segment_paths: List of audio file paths to transcribe
+        output_dir: Directory to save transcript files
+        target_name: Name of target speaker
+        segment_label: Label for this batch of segments
+        model_name: Name of ASR model (used only if model_instance is None)
+        asr_engine: ASR engine to use ("whisper" or "nemo")
+        language: Language for transcription (used by Whisper)
+        whisper_model_instance: Pre-loaded Whisper model instance (preferred for performance)
+        nemo_model_instance: Pre-loaded NeMo ASR model instance (preferred for performance)
     """
-    if not segment_paths: 
-        log.info(f"No '{segment_type_tag}' segments for '{target_name}' to transcribe."); return
+    ensure_dir_exists(output_dir)
     
-    log.info(f"Transcribing {len(segment_paths)} '{segment_type_tag}' segments for '{target_name}' using Whisper model '{whisper_model_name}'...")
-    if DEVICE.type == "cuda": torch.cuda.empty_cache()
+    log.info(f"Transcribing {len(segment_paths)} {segment_label} segments of '{target_name}' with {asr_engine.upper()}...")
+    if not segment_paths:
+        log.warning(f"No {segment_label} segments to transcribe.")
+        return {}
+
+    # Load model once if not provided
+    model_to_use = None
     
-    # Ensure output directories exist
-    ensure_dir_exists(output_transcripts_main_dir)
-
-    model = whisper_model_instance
-    if model is None:
-        try:
-            log.info(f"Loading Whisper model '{whisper_model_name}' to {DEVICE.type.upper()}...")
-            model = whisper.load_model(whisper_model_name, device=DEVICE)
-            log.info(f"Whisper model '{whisper_model_name}' loaded.")
-        except Exception as e: 
-            log.error(f"Failed to load Whisper model '{whisper_model_name}': {e}. Transcription skipped."); return
-
-    transcription_data_for_csv = []
-    plain_text_transcript_lines = []
-
-    # Construct CSV/TXT output paths in the main transcript dir
-    file_prefix = f"{safe_filename(target_name)}_{safe_filename(segment_type_tag)}"
-    csv_path = output_transcripts_main_dir / f"{file_prefix}_transcripts.csv"
-    txt_path = output_transcripts_main_dir / f"{file_prefix}_transcripts.txt"
-
-    # Regex to parse start/end times from segment filenames like "target_solo_final_0000_0p123s_to_1p456s.wav"
-    time_pattern = re.compile(r"(\d+p\d+s)_to_(\d+p\d+)s") # Simpler, grabs the two time strings
-
-    def get_sort_key_time(p: Path):
-        try:
-            match = time_pattern.search(p.stem)
-            if match:
-                start_time_str = match.group(1) # e.g., "0p123s"
-                return float(start_time_str.replace('p', '.').removesuffix('s'))
-            return 0.0 # Fallback if pattern not found
-        except: return 0.0
-        
-    sorted_segment_paths = sorted(segment_paths, key=get_sort_key_time)
-
-    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
-        task = pb.add_task(f"Whisper ({target_name}, {segment_type_tag})...", total=len(sorted_segment_paths))
-        for wav_file in sorted_segment_paths:
-            if not wav_file.exists() or wav_file.stat().st_size == 0: 
-                log.warning(f"Skipping missing/empty segment: {wav_file.name}"); pb.update(task, advance=1); continue
-            
-            text_transcript = "[TRANSCRIPTION ERROR]"; s_time_val, e_time_val = 0.0, 0.0
+    if asr_engine.lower() == "nemo" and HAVE_NEMO_ASR:
+        model_to_use = nemo_model_instance
+        if model_to_use is None and segment_paths:
             try:
-                match = time_pattern.search(wav_file.stem)
-                if match:
-                    s_time_str_part, e_time_str_part = match.groups()
-                    s_time_val = float(s_time_str_part.replace('p','.').removesuffix('s'))
-                    e_time_val = float(e_time_str_part.replace('p','.').removesuffix('s'))
-                else:
-                    log.warning(f"Could not parse start/end time from filename '{wav_file.name}' for transcript metadata. Using 0.0.")
-
-                # Whisper transcription options
-                opts = {"fp16": DEVICE.type == "cuda"}
-                if language and language.lower() != "auto": opts["language"] = language
+                log.info(f"Loading NeMo ASR model '{model_name}' for batch transcription...")
+                model_to_use = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
+                if DEVICE.type == "cuda":
+                    model_to_use = model_to_use.to(DEVICE)
+                log.info(f"NeMo ASR model '{model_name}' loaded for batch processing.")
+            except Exception as e:
+                log.error(f"Failed to load NeMo ASR model '{model_name}': {e}")
+                return {}
+        elif model_to_use is not None:
+            log.info(f"Using pre-loaded NeMo ASR model for batch transcription of {len(segment_paths)} segments.")
+    else:
+        # Use Whisper (default or fallback)
+        if asr_engine.lower() == "nemo" and not HAVE_NEMO_ASR:
+            log.warning("NeMo ASR requested but not available. Falling back to Whisper.")
+        
+        model_to_use = whisper_model_instance
+        if model_to_use is None and segment_paths:
+            try:
+                log.info(f"Loading Whisper model '{model_name}' for batch transcription...")
+                model_to_use = whisper.load_model(model_name, device=DEVICE)
+                log.info(f"Whisper model '{model_name}' loaded for batch processing.")
+            except Exception as e:
+                log.error(f"Failed to load Whisper model '{model_name}': {e}")
+                return {}
+        elif model_to_use is not None:
+            log.info(f"Using pre-loaded Whisper model for batch transcription of {len(segment_paths)} segments.")    # Use batch transcription for better performance
+    log.info(f"Batch transcribing {len(segment_paths)} segments with {asr_engine.upper()}...")
+    
+    transcripts = {}
+    
+    with Progress(*Progress.get_default_columns(), console=console, transient=True) as pb:
+        task = pb.add_task("Transcribing segments...", total=len(segment_paths))
+        
+        for segment_path in segment_paths:
+            if not segment_path.exists():
+                log.warning(f"Segment file not found: {segment_path}")
+                pb.update(task, advance=1)
+                continue
                 
-                result = model.transcribe(str(wav_file), **opts)
-                text_transcript = result["text"].strip()
-
-            except Exception as e_transcribe:
-                log.error(f"Error transcribing {wav_file.name}: {e_transcribe}")
-            
-            duration = librosa.get_duration(path=wav_file)
-            transcription_data_for_csv.append([f"{s_time_val:.3f}", f"{e_time_val:.3f}", f"{duration:.3f}", wav_file.name, text_transcript])
-            plain_text_transcript_lines.append(f"[{format_duration(s_time_val)} - {format_duration(e_time_val)}] {wav_file.name} (Dur: {duration:.2f}s):\n{text_transcript}\n---")
-
+            try:
+                transcript_text = ""
+                
+                if asr_engine.lower() == "nemo" and HAVE_NEMO_ASR and model_to_use:
+                    # Use NeMo ASR for transcription
+                    # NeMo requires mono audio, so ensure the audio is converted if needed
+                    try:
+                        import librosa
+                        import soundfile as sf
+                        # Load audio and ensure it's mono at 16kHz
+                        audio_data, sr = librosa.load(str(segment_path), sr=16000, mono=True)
+                        # Create temporary mono file
+                        temp_mono_file = segment_path.parent / f"temp_mono_{segment_path.name}"
+                        sf.write(str(temp_mono_file), audio_data, sr)
+                        output = model_to_use.transcribe([str(temp_mono_file)])
+                        # Clean up temporary file
+                        temp_mono_file.unlink()
+                    except Exception as e_mono:
+                        log.warning(f"Failed to preprocess audio for NeMo: {e_mono}, trying direct transcription")
+                        output = model_to_use.transcribe([str(segment_path)])
+                    
+                    if output and len(output) > 0:
+                        transcript_text = output[0].text.strip() if hasattr(output[0], 'text') else str(output[0]).strip()
+                else:
+                    # Use Whisper for transcription
+                    result = model_to_use.transcribe(
+                        str(segment_path),
+                        language=language,
+                        verbose=False,
+                        word_timestamps=False
+                    )
+                    transcript_text = result.get("text", "").strip()
+                
+                if transcript_text:
+                    transcripts[segment_path.name] = transcript_text
+                    log.debug(f"Transcribed '{segment_path.name}': {transcript_text[:100]}...")
+                    
+                    # Save transcript to file
+                    transcript_filename = f"{segment_path.stem}_transcript.txt"
+                    transcript_file_path = output_dir / transcript_filename
+                    try:
+                        with open(transcript_file_path, "w", encoding="utf-8") as f:
+                            f.write(transcript_text)
+                        log.debug(f"Saved transcript to: {transcript_filename}")
+                    except Exception as save_e:
+                        log.error(f"Failed to save transcript for {segment_path.name}: {save_e}")
+                else:
+                    log.warning(f"Empty transcription for: {segment_path.name}")
+                    
+            except Exception as e:
+                log.error(f"Failed to transcribe {segment_path.name}: {e}")
+                
             pb.update(task, advance=1)
 
-    # Save consolidated CSV and TXT transcripts
-    if transcription_data_for_csv:
-        try:
-            with csv_path.open("w", newline='', encoding="utf-8") as f_csv:
-                writer = csv.writer(f_csv)
-                writer.writerow(["original_start_s", "original_end_s", "segment_duration_s", "filename", "transcript"])
-                writer.writerows(transcription_data_for_csv)
-            log.info(f"Saved {len(transcription_data_for_csv)} transcripts to CSV: {csv_path.name}")
-            
-            txt_path.write_text("\n".join(plain_text_transcript_lines), encoding="utf-8")
-            log.info(f"Saved transcripts to TXT: {txt_path.name}")
-        except Exception as e_save_trans:
-            log.error(f"Failed to save consolidated transcripts: {e_save_trans}")
-    
-    log.info(f"[green]✓ Transcription completed for '{target_name}' ({segment_type_tag}).[/]")
+    total_transcribed = len(transcripts)
+    log.info(f"[green]✓ Transcribed {total_transcribed} of {len(segment_paths)} {segment_label} segments for '{target_name}' using {asr_engine.upper()}.[/]")
+    return transcripts
 
 
 def concatenate_segments(
-    audio_segment_paths: list[Path], destination_concatenated_file: Path, tmp_dir_concat: Path,
-    silence_duration: float = 0.5, output_sr_concat: int = 44100, output_channels_concat: int = 1
+    audio_segment_paths: list[Path],
+    destination_concatenated_file: Path,
+    tmp_dir_concat: Path,
+    silence_duration: float = 0.5,
+    output_sr_concat: int = 44100,
+    output_channels_concat: int = 1,
 ) -> bool:
-    if not audio_segment_paths: 
-        log.warning(f"No segments to concatenate for {destination_concatenated_file.name}."); return False
-    
+    if not audio_segment_paths:
+        log.warning(
+            f"No segments to concatenate for {destination_concatenated_file.name}."
+        )
+        return False
+
     ensure_dir_exists(tmp_dir_concat)
     ensure_dir_exists(destination_concatenated_file.parent)
 
     # Sort segments by original start time parsed from filename
     # Filename pattern: {target_name}_solo_final_{id}_{start_time_str}s_to_{end_time_str}s.wav
-    time_pattern_concat = re.compile(r"(\d+p\d+)s_to_") 
+    time_pattern_concat = re.compile(r"(\d+p\d+)s_to_")
 
     def get_sort_key_concat(p: Path):
         try:
             match = time_pattern_concat.search(p.stem)
             if match:
-                start_time_str = match.group(1) # e.g. "0p123"
-                return float(start_time_str.replace('p', '.')) # Convert "0p123" to 0.123
-            log.debug(f"Could not parse start time from {p.name} for sorting concat list. Using 0.0 as sort key.")
-            return 0.0 # Default sort key if pattern mismatch
+                start_time_str = match.group(1)  # e.g. "0p123"
+                return float(
+                    start_time_str.replace("p", ".")
+                )  # Convert "0p123" to 0.123
+            log.debug(
+                f"Could not parse start time from {p.name} for sorting concat list. Using 0.0 as sort key."
+            )
+            return 0.0  # Default sort key if pattern mismatch
         except Exception as e_sort:
             log.debug(f"Error parsing sort key from {p.name}: {e_sort}. Using 0.0.")
             return 0.0
-            
+
     sorted_audio_paths = sorted(audio_segment_paths, key=get_sort_key_concat)
 
-    silence_file = tmp_dir_concat / f"silence_{silence_duration}s_{output_sr_concat}hz_{output_channels_concat}ch.wav"
+    silence_file = (
+        tmp_dir_concat
+        / f"silence_{silence_duration}s_{output_sr_concat}hz_{output_channels_concat}ch.wav"
+    )
     if silence_duration > 0:
         try:
             if not silence_file.exists() or silence_file.stat().st_size == 0:
-                channel_layout_str = 'mono' if output_channels_concat == 1 else 'stereo' # Adjust if more channels needed
+                channel_layout_str = (
+                    "mono" if output_channels_concat == 1 else "stereo"
+                )  # Adjust if more channels needed
                 anullsrc_description = f"anullsrc=channel_layout={channel_layout_str}:sample_rate={output_sr_concat}"
-                (ffmpeg
-                    .input(anullsrc_description, format='lavfi', t=str(silence_duration))
-                    .output(str(silence_file), acodec='pcm_s16le', ar=str(output_sr_concat), ac=output_channels_concat)
+                (
+                    ffmpeg.input(
+                        anullsrc_description, format="lavfi", t=str(silence_duration)
+                    )
+                    .output(
+                        str(silence_file),
+                        acodec="pcm_s16le",
+                        ar=str(output_sr_concat),
+                        ac=output_channels_concat,
+                    )
                     .overwrite_output()
-                    .run(quiet=True, capture_stdout=True, capture_stderr=True))
+                    .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                )
         except ffmpeg.Error as e_ff_silence:
-            err_msg = e_ff_silence.stderr.decode(errors='ignore') if e_ff_silence.stderr else 'ffmpeg error'
-            log.error(f"ffmpeg failed to create silence file: {err_msg}"); return False
+            err_msg = (
+                e_ff_silence.stderr.decode(errors="ignore")
+                if e_ff_silence.stderr
+                else "ffmpeg error"
+            )
+            log.error(f"ffmpeg failed to create silence file: {err_msg}")
+            return False
 
-    list_file_path = tmp_dir_concat / f"{destination_concatenated_file.stem}_concat_list.txt"
+    list_file_path = (
+        tmp_dir_concat / f"{destination_concatenated_file.stem}_concat_list.txt"
+    )
     concat_lines = []
     valid_segment_count = 0
     for i, audio_path in enumerate(sorted_audio_paths):
         if not audio_path.exists() or audio_path.stat().st_size == 0:
-            log.warning(f"Segment {audio_path.name} for concatenation is missing or empty. Skipping."); continue
-        
+            log.warning(
+                f"Segment {audio_path.name} for concatenation is missing or empty. Skipping."
+            )
+            continue
+
         if i > 0 and silence_duration > 0 and silence_file.exists():
             concat_lines.append(f"file '{silence_file.resolve().as_posix()}'")
         concat_lines.append(f"file '{audio_path.resolve().as_posix()}'")
         valid_segment_count += 1
 
     if valid_segment_count == 0:
-        log.warning(f"No valid segments to concatenate for {destination_concatenated_file.name}."); return False
-    
+        log.warning(
+            f"No valid segments to concatenate for {destination_concatenated_file.name}."
+        )
+        return False
+
     # If only one valid segment and no silence, just copy/re-encode it
     if valid_segment_count == 1 and silence_duration == 0:
-        single_valid_path = Path(concat_lines[0].split("'")[1]) # Extract path from "file 'path'"
-        log.info(f"Only one segment to 'concatenate'. Copying/Re-encoding {single_valid_path.name} to {destination_concatenated_file.name}")
+        single_valid_path = Path(
+            concat_lines[0].split("'")[1]
+        )  # Extract path from "file 'path'"
+        log.info(
+            f"Only one segment to 'concatenate'. Copying/Re-encoding {single_valid_path.name} to {destination_concatenated_file.name}"
+        )
         try:
-            (ffmpeg.input(str(single_valid_path))
-                   .output(str(destination_concatenated_file), acodec='pcm_s16le', ar=output_sr_concat, ac=output_channels_concat)
-                   .overwrite_output().run(quiet=True))
+            (
+                ffmpeg.input(str(single_valid_path))
+                .output(
+                    str(destination_concatenated_file),
+                    acodec="pcm_s16le",
+                    ar=output_sr_concat,
+                    ac=output_channels_concat,
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
             return True
         except ffmpeg.Error as e_ff_single:
-            err_msg = e_ff_single.stderr.decode(errors='ignore') if e_ff_single.stderr else 'ffmpeg error'
-            log.error(f"ffmpeg single segment copy/re-encode failed: {err_msg}"); return False
+            err_msg = (
+                e_ff_single.stderr.decode(errors="ignore")
+                if e_ff_single.stderr
+                else "ffmpeg error"
+            )
+            log.error(f"ffmpeg single segment copy/re-encode failed: {err_msg}")
+            return False
 
     try:
         list_file_path.write_text("\n".join(concat_lines), encoding="utf-8")
     except Exception as e_write_list:
-        log.error(f"Failed to write ffmpeg concatenation list file {list_file_path.name}: {e_write_list}"); return False
+        log.error(
+            f"Failed to write ffmpeg concatenation list file {list_file_path.name}: {e_write_list}"
+        )
+        return False
 
-    log.info(f"Concatenating {valid_segment_count} segments to: {destination_concatenated_file.name}...")
+    log.info(
+        f"Concatenating {valid_segment_count} segments to: {destination_concatenated_file.name}..."
+    )
     try:
-        (ffmpeg.input(str(list_file_path), format="concat", safe=0) # safe=0 allows absolute paths
-               .output(str(destination_concatenated_file), acodec="pcm_s16le", ar=output_sr_concat, ac=output_channels_concat)
-               .overwrite_output().run(quiet=True, capture_stdout=True, capture_stderr=True))
-        log.info(f"[green]✓ Successfully concatenated segments to: {destination_concatenated_file.name}[/]")
+        (
+            ffmpeg.input(
+                str(list_file_path), format="concat", safe=0
+            )  # safe=0 allows absolute paths
+            .output(
+                str(destination_concatenated_file),
+                acodec="pcm_s16le",
+                ar=output_sr_concat,
+                ac=output_channels_concat,
+            )
+            .overwrite_output()
+            .run(quiet=True, capture_stdout=True, capture_stderr=True)
+        )
+        log.info(
+            f"[green]✓ Successfully concatenated segments to: {destination_concatenated_file.name}[/]"
+        )
         return True
     except ffmpeg.Error as e_ff_concat:
-        err_msg = e_ff_concat.stderr.decode(errors='ignore') if e_ff_concat.stderr else 'ffmpeg error'
-        log.error(f"ffmpeg concatenation failed for {destination_concatenated_file.name}: {err_msg}")
-        log.debug(f"Concatenation list file content ({list_file_path.name}):\n" + "\n".join(concat_lines)); return False
+        err_msg = (
+            e_ff_concat.stderr.decode(errors="ignore")
+            if e_ff_concat.stderr
+            else "ffmpeg error"
+        )
+        log.error(
+            f"ffmpeg concatenation failed for {destination_concatenated_file.name}: {err_msg}"
+        )
+        log.debug(
+            f"Concatenation list file content ({list_file_path.name}):\n"
+            + "\n".join(concat_lines)
+        )
+        return False
     finally:
         # Clean up temporary files
-        if list_file_path.exists(): list_file_path.unlink(missing_ok=True)
-        if silence_duration > 0 and silence_file.exists(): silence_file.unlink(missing_ok=True)
+        if list_file_path.exists():
+            list_file_path.unlink(missing_ok=True)
+        if silence_duration > 0 and silence_file.exists():
+            silence_file.unlink(missing_ok=True)
+
+
+
 
 def classify_segments_for_noise(
     segment_paths: list[Path],
@@ -1587,10 +2445,154 @@ def run_bandit_on_noisy_segments(
     log.info(f"Bandit-v2 processing complete. Successfully cleaned {len(cleaned_segment_paths)} segments.")
     return cleaned_segment_paths
 
-if __name__ == '__main__':
-    log.info("audio_pipeline.py executed directly. This script is intended to be imported as a module.")
-    # Add test calls here if needed for individual functions
-    # Example:
-    # log.info(f"Bandit-v2 available: {HAVE_BANDIT_V2}")
-    # log.info(f"WeSpeaker available: {HAVE_WESPEAKER}")
-    # log.info(f"SpeechBrain available: {HAVE_SPEECHBRAIN}")
+def run_audio_separator_on_noisy_segments(
+    noisy_paths: list[Path], 
+    audio_separator: object,
+    output_dir_cleaned: Path,
+    tmp_dir: Path
+) -> list[Path]:
+    """
+    Runs Audio Separator (Mel-Roformer) vocal separation on a list of noisy audio files.
+    
+    Args:
+        noisy_paths: List of paths to noisy audio files
+        audio_separator: Initialized Separator instance with loaded model
+        output_dir_cleaned: Directory to store cleaned vocals
+        tmp_dir: Temporary directory for processing
+    
+    Returns:
+        List of paths to cleaned vocal files
+    """
+    if not noisy_paths:
+        log.info("No noisy segments to process with Audio Separator.")
+        return []
+
+    if audio_separator is None:
+        log.error("Audio separator is not initialized")
+        return []
+
+    ensure_dir_exists(output_dir_cleaned)
+    cleaned_paths = []
+    
+    log.info(f"Processing {len(noisy_paths)} noisy segments with Audio Separator (Mel-Roformer)")
+    
+    for noisy_path in noisy_paths:
+        try:
+            # Output filename for cleaned vocals
+            cleaned_filename = output_dir_cleaned / f"{noisy_path.stem}_cleaned_bs_roformer.wav"
+            
+            if cleaned_filename.exists() and cleaned_filename.stat().st_size > 0:
+                log.info(f"Found existing cleaned file, skipping: {cleaned_filename.name}")
+                cleaned_paths.append(cleaned_filename)
+                continue
+            
+            # Check audio duration and apply padding if needed
+            try:
+                import librosa
+                audio_data, sr = librosa.load(str(noisy_path), sr=None)
+                audio_duration_seconds = len(audio_data) / sr
+            except Exception as load_err:
+                log.warning(f"Could not analyze audio duration for {noisy_path.name}: {load_err}")
+                audio_duration_seconds = None
+            
+            # Implement padding logic for audio shorter than 8 seconds
+            MIN_AUDIO_DURATION = 8.0  # 8 seconds
+            PADDING_BUFFER = 0.05  # 50ms buffer
+            effective_min_duration = MIN_AUDIO_DURATION + PADDING_BUFFER
+            
+            processed_input_path = noisy_path
+            temp_padded_file_path = None
+            original_duration_ms = None
+            padding_applied = False
+            
+            # Check if audio is shorter than minimum duration
+            if audio_duration_seconds is not None and audio_duration_seconds < effective_min_duration:
+                log.info(f"Audio {noisy_path.name} duration {audio_duration_seconds:.2f}s is less than minimum {effective_min_duration:.2f}s. Applying padding...")
+                
+                try:
+                    # Load audio with pydub for padding
+                    original_audio = AudioSegment.from_wav(str(noisy_path))
+                    original_duration_ms = len(original_audio)
+                    
+                    # Calculate padding needed
+                    target_duration_ms = int(effective_min_duration * 1000)
+                    padding_duration_ms = target_duration_ms - original_duration_ms
+                    
+                    if padding_duration_ms > 0:
+                        # Create silence for padding
+                        silence = AudioSegment.silent(duration=padding_duration_ms)
+                        padded_audio = original_audio + silence
+                        
+                        # Create temporary file for padded audio
+                        temp_padded_file_path = tmp_dir / f"temp_padded_{noisy_path.stem}.wav"
+                        
+                        # Export padded audio
+                        padded_audio.export(str(temp_padded_file_path), format="wav")
+                        processed_input_path = temp_padded_file_path
+                        padding_applied = True
+                        
+                        log.info(f"Applied {padding_duration_ms}ms padding to {noisy_path.name}")
+                    
+                except Exception as pad_err:
+                    log.warning(f"Failed to apply padding to {noisy_path.name}: {pad_err}")
+                    log.info("Proceeding with original audio file...")
+                    processed_input_path = noisy_path
+            else:
+                if audio_duration_seconds is not None:
+                    log.debug(f"Audio {noisy_path.name} duration {audio_duration_seconds:.2f}s is sufficient. No padding needed.")
+            
+            # Define output names for separation
+            output_names = {
+                "Vocals": cleaned_filename.stem,
+                "Instrumental": f"{noisy_path.stem}_instrumental_bs_roformer"
+            }
+            
+            # Perform separation on the processed input (potentially padded)
+            log.info(f"Cleaning noisy segment: {processed_input_path.name}")
+            output_files = audio_separator.separate([str(processed_input_path)], output_names)
+            
+            # Find the vocals file from the output
+            vocals_found = False
+            for file_path in output_files:
+                if "vocals" in file_path.lower() or cleaned_filename.name in file_path:
+                    vocals_file = Path(file_path)
+                      # Move to the expected output location if needed
+                    if vocals_file != cleaned_filename:
+                        shutil.move(str(vocals_file), str(cleaned_filename))
+                    
+                    cleaned_paths.append(cleaned_filename)
+                    vocals_found = True
+                    break
+            
+            if not vocals_found and cleaned_filename.exists():
+                cleaned_paths.append(cleaned_filename)
+                vocals_found = True
+            
+            # Trim padding from output file if padding was applied
+            if padding_applied and original_duration_ms is not None and vocals_found and cleaned_filename.exists():
+                try:
+                    log.info(f"Trimming padding from cleaned file: {cleaned_filename.name}")
+                    cleaned_audio = AudioSegment.from_wav(str(cleaned_filename))
+                    trimmed_audio = cleaned_audio[:original_duration_ms]
+                    trimmed_audio.export(str(cleaned_filename), format="wav")
+                    log.info(f"Successfully trimmed padding from: {cleaned_filename.name}")
+                except Exception as trim_err:
+                    log.warning(f"Failed to trim padding from {cleaned_filename.name}: {trim_err}")
+            
+            # Clean up temporary padded file if it was created
+            if temp_padded_file_path and temp_padded_file_path.exists():
+                try:
+                    temp_padded_file_path.unlink()
+                    log.debug(f"Cleaned up temporary padded file: {temp_padded_file_path.name}")
+                except Exception as cleanup_err:
+                    log.warning(f"Failed to clean up temporary padded file: {cleanup_err}")
+            
+            if not vocals_found:
+                log.warning(f"Failed to clean segment: {noisy_path.name}")
+                
+        except Exception as e:
+            log.error(f"Failed to process noisy segment {noisy_path.name}: {e}")
+            continue
+    
+    log.info(f"Successfully cleaned {len(cleaned_paths)} out of {len(noisy_paths)} noisy segments")
+    return cleaned_paths
