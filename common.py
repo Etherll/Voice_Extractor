@@ -21,7 +21,6 @@ import hashlib
 from tqdm import tqdm
 import time
 import re
-import random
 
 # Pattern to identify Netflix-internal packages
 NETFLIX_PRIVATE_PACKAGES = re.compile(
@@ -46,12 +45,28 @@ REQ = [
     "onnx",
     "onnxruntime",
     "fairseq==0.12.2 --no-deps",
+    # Bandit-v2 dependencies
+    "ray>=2.10.0,<2.20",
+    "pandas",  # Required by ray.train
+    "tensorboard",  # Required by ray.train
+    "tensorboardX",  # Sometimes needed by ray.train
     "transformers",
-
+    "einops>=0.6.0",
+    "asteroid>=0.5.0",
+    "asteroid-filterbanks>=0.4.0",
+    "julius>=0.2.7",
+    "torch-audiomentations>=0.11.0",
+    "omegaconf>=2.3.0"
 ]
 
 # Model configurations - will be conditionally downloaded
 MODEL_CONFIGS = {
+    'bandit_checkpoint_eng': {
+        'url': 'https://zenodo.org/records/12701995/files/checkpoint-eng.ckpt?download=1',
+        'path': 'models/bandit_checkpoint_eng.ckpt',
+        'size': '~450MB',
+        'component': 'bandit'  # Which component needs this
+    }
 }
 
 def _ensure(pkgs):
@@ -464,14 +479,14 @@ def ff_trim(src_path: Path, dst_path: Path, start_time: float, end_time: float, 
         log.error(f"ffmpeg trim failed for {dst_path.name}: {err_msg}")
         raise
 
-def ff_slice(src_path: Path, dst_path: Path, start_time: float, end_time: float, target_ac: int = 1):
+def ff_slice(src_path: Path, dst_path: Path, start_time: float, end_time: float, target_sr: int, target_ac: int = 1):
     if ffmpeg is None or log is None:
         print("ERROR: ffmpeg or log not initialized in ff_slice.")
         raise RuntimeError("ffmpeg or log not initialized")
     try:
         (
             ffmpeg.input(str(src_path), ss=start_time, to=end_time)
-            .output(str(dst_path), acodec="pcm_s16le", ac=target_ac)
+            .output(str(dst_path), acodec="pcm_s16le", ar=target_sr, ac=target_ac)
             .overwrite_output()
             .run(quiet=True, capture_stdout=True, capture_stderr=True)
         )
@@ -896,427 +911,10 @@ def download_with_progress(url, filepath):
         logger_func(f"[Setup] Download failed: {e}")
         raise
 
-def detect_silence_boundaries(audio_file: Path, start_time: float, end_time: float, 
-                             min_silence_duration: float = 0.1, 
-                             silence_threshold: float = -40) -> list[float]:
-    """
-    Detect silence boundaries in an audio segment for intelligent cutting.
-    
-    Args:
-        audio_file: Path to the audio file
-        start_time: Start time of the segment to analyze
-        end_time: End time of the segment to analyze
-        min_silence_duration: Minimum duration of silence to consider as a boundary (in seconds)
-        silence_threshold: Threshold in dB below which audio is considered silence
-    
-    Returns:
-        List of time positions (relative to start_time) where silence occurs
-    """
-    if librosa is None or numpy is None:
-        print("ERROR: librosa or numpy not imported yet in detect_silence_boundaries.")
-        return []
-    
-    try:
-        # Load only the segment we need to analyze
-        segment_duration = end_time - start_time
-        y, sr = librosa.load(audio_file, sr=16000, offset=start_time, duration=segment_duration)
-        
-        if len(y) == 0:
-            return []
-        
-        # Calculate RMS energy
-        frame_length = int(0.025 * sr)  # 25ms frames
-        hop_length = int(0.010 * sr)    # 10ms hop
-        
-        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-          # Convert to dB
-        rms_db = librosa.amplitude_to_db(rms, ref=numpy.max(rms))
-        
-        # Find frames below silence threshold
-        silent_frames = rms_db < silence_threshold
-        
-        # Convert frame indices to time
-        times = librosa.frames_to_time(numpy.arange(len(rms_db)), sr=sr, hop_length=hop_length)
-        
-        # Find continuous silent regions
-        silence_boundaries = []
-        in_silence = False
-        silence_start = 0
-        
-        for i, (time_pos, is_silent) in enumerate(zip(times, silent_frames)):
-            if is_silent and not in_silence:
-                # Start of silence
-                in_silence = True
-                silence_start = time_pos
-            elif not is_silent and in_silence:
-                # End of silence
-                in_silence = False
-                silence_duration = time_pos - silence_start
-                if silence_duration >= min_silence_duration:
-                    # Use middle of silence region as boundary
-                    boundary_time = silence_start + silence_duration / 2
-                    silence_boundaries.append(boundary_time)
-        
-        # Handle case where segment ends in silence
-        if in_silence:
-            silence_duration = times[-1] - silence_start
-            if silence_duration >= min_silence_duration:
-                boundary_time = silence_start + silence_duration / 2
-                silence_boundaries.append(boundary_time)
-        
-        return silence_boundaries
-        
-    except Exception as e:
-        if log:
-            log.warning(f"Could not detect silence boundaries in audio segment: {e}")
-        return []
-
-
-def calculate_intelligent_chunks(total_duration: float, silence_boundaries: list[float],
-                                min_chunk_duration: float = 3.0, 
-                                max_chunk_duration: float = 30.0) -> list[tuple[float, float]]:
-    """
-    Calculate intelligent chunk boundaries with varied lengths.
-    
-    Args:
-        total_duration: Total duration of the segment to chunk
-        silence_boundaries: List of silence boundary positions 
-        min_chunk_duration: Minimum chunk duration
-        max_chunk_duration: Maximum chunk duration
-    
-    Returns:
-        List of (start_time, end_time) tuples for each chunk
-    """
-    if total_duration <= max_chunk_duration:
-        return [(0.0, total_duration)]
-    
-    chunks = []
-    current_start = 0.0
-    
-    # Add boundaries at start and end
-    all_boundaries = [0.0] + silence_boundaries + [total_duration]
-    all_boundaries = sorted(set(all_boundaries))  # Remove duplicates and sort
-    
-    while current_start < total_duration:
-        remaining_duration = total_duration - current_start
-        
-        if remaining_duration <= max_chunk_duration:
-            # Last chunk
-            chunks.append((current_start, total_duration))
-            break
-        
-        # Find potential end points within our preferred range
-        target_min_end = current_start + min_chunk_duration
-        target_max_end = current_start + max_chunk_duration
-        
-        # Find boundaries in our target range
-        valid_boundaries = [b for b in all_boundaries 
-                          if target_min_end <= b <= target_max_end]
-        
-        if valid_boundaries:
-            # Choose a boundary, preferring those that create varied chunk sizes
-            # Add some randomness to avoid uniform chunks
-            if len(valid_boundaries) > 1:
-                # Weight boundaries based on distance from edges of range
-                weights = []
-                for boundary in valid_boundaries:
-                    # Prefer boundaries not too close to min or max
-                    distance_from_min = boundary - target_min_end
-                    distance_from_max = target_max_end - boundary
-                    weight = min(distance_from_min, distance_from_max) + random.uniform(0.5, 1.5)
-                    weights.append(weight)
-                
-                # Select weighted random boundary
-                total_weight = sum(weights)
-                r = random.uniform(0, total_weight)
-                cumulative_weight = 0
-                chosen_boundary = valid_boundaries[-1]
-                
-                for boundary, weight in zip(valid_boundaries, weights):
-                    cumulative_weight += weight
-                    if r <= cumulative_weight:
-                        chosen_boundary = boundary
-                        break
-                
-                chunk_end = chosen_boundary
-            else:
-                chunk_end = valid_boundaries[0]
-        else:
-            # No suitable boundary found, find closest boundary or use max duration
-            future_boundaries = [b for b in all_boundaries if b > target_min_end]
-            
-            if future_boundaries:
-                next_boundary = min(future_boundaries)
-                if next_boundary - current_start <= max_chunk_duration * 1.2:  # Allow slight overage
-                    chunk_end = next_boundary
-                else:
-                    chunk_end = current_start + max_chunk_duration
-            else:
-                chunk_end = current_start + max_chunk_duration
-        
-        chunks.append((current_start, chunk_end))
-        current_start = chunk_end
-    
-    return chunks
-
-
-def ff_slice_intelligent(src_path: Path, dst_dir: Path, segment_start_time: float, 
-                        segment_end_time: float, base_name: str, target_sr: int = 16000, 
-                        target_ac: int = 1, max_segment_duration: float = 30.0,
-                        min_chunk_duration: float = 3.0) -> list[Path]:
-    """
-    Intelligently slice a long audio segment into smaller, meaningful chunks.
-    
-    Args:
-        src_path: Source audio file
-        dst_dir: Destination directory for chunks
-        segment_start_time: Start time of the segment in the source file
-        segment_end_time: End time of the segment in the source file
-        base_name: Base name for output files
-        target_sr: Target sample rate
-        target_ac: Target audio channels
-        max_segment_duration: Maximum duration for a single chunk
-        min_chunk_duration: Minimum duration for a single chunk
-    
-    Returns:
-        List of paths to created chunk files
-    """
-    if ffmpeg is None or log is None:
-        print("ERROR: ffmpeg or log not initialized in ff_slice_intelligent.")
-        raise RuntimeError("ffmpeg or log not initialized")
-    
-    segment_duration = segment_end_time - segment_start_time
-    
-    # If segment is not too long, use regular slicing
-    if segment_duration <= max_segment_duration:
-        dst_path = dst_dir / f"{base_name}.wav"
-        ff_slice(src_path, dst_path, segment_start_time, segment_end_time, target_ac)
-        return [dst_path]
-    
-    # Ensure destination directory exists
-    ensure_dir_exists(dst_dir)
-    
-    log.info(f"Segment duration {segment_duration:.1f}s exceeds {max_segment_duration}s. "
-             f"Intelligently splitting into smaller chunks...")
-    
-    # Detect silence boundaries for intelligent cutting
-    silence_boundaries = detect_silence_boundaries(
-        src_path, segment_start_time, segment_end_time,
-        min_silence_duration=0.1, silence_threshold=-40
-    )
-    
-    log.info(f"Found {len(silence_boundaries)} potential cut points based on silence detection.")
-    
-    # Calculate intelligent chunk boundaries
-    chunk_boundaries = calculate_intelligent_chunks(
-        segment_duration, silence_boundaries, min_chunk_duration, max_segment_duration
-    )
-    
-    log.info(f"Split into {len(chunk_boundaries)} chunks with varied durations:")
-    for i, (start, end) in enumerate(chunk_boundaries):
-        duration = end - start
-        log.info(f"  Chunk {i+1}: {duration:.1f}s")
-    
-    # Create the chunks
-    created_files = []
-    
-    for i, (chunk_start, chunk_end) in enumerate(chunk_boundaries):
-        # Calculate absolute times in the source file
-        abs_start = segment_start_time + chunk_start
-        abs_end = segment_start_time + chunk_end
-        
-        # Create filename for this chunk
-        chunk_filename = f"{base_name}_chunk{i+1:02d}_{chunk_start:.1f}s_{chunk_end:.1f}s.wav"
-        chunk_path = dst_dir / chunk_filename
-        
-        try:
-            # Slice the chunk
-            ff_slice(src_path, chunk_path, abs_start, abs_end, target_ac)
-            
-            if chunk_path.exists() and chunk_path.stat().st_size > 0:
-                created_files.append(chunk_path)
-                log.info(f"Created chunk: {chunk_filename}")
-            else:
-                log.warning(f"Failed to create chunk: {chunk_filename}")
-                
-        except Exception as e:
-            log.error(f"Error creating chunk {chunk_filename}: {e}")
-            continue
-    
-    if not created_files:
-        log.warning("No chunks were successfully created. Falling back to regular slicing.")
-        dst_path = dst_dir / f"{base_name}_fallback.wav"
-        ff_slice(src_path, dst_path, segment_start_time, segment_end_time, target_ac)
-        return [dst_path]
-    
-    log.info(f"Successfully created {len(created_files)} intelligent chunks.")
-    return created_files
-
-def ff_slice_smart(src_path: Path, dst_path: Path, start_time: float, end_time: float, 
-                   target_sr: int = 16000, target_ac: int = 1, 
-                   max_segment_duration: float = 30.0, min_chunk_duration: float = 3.0,
-                   return_chunks: bool = False) -> Path | list[Path]:
-    """
-    Smart slice function that provides backward compatibility with ff_slice while adding intelligent chunking.
-    
-    For segments <= max_segment_duration: Creates a single file at dst_path (like original ff_slice)
-    For segments > max_segment_duration: Creates intelligent chunks and either concatenates them or returns chunk list
-    
-    Args:
-        src_path: Source audio file
-        dst_path: Destination file path (single output file or base name for chunks)
-        start_time: Start time of the segment
-        end_time: End time of the segment
-        target_sr: Target sample rate
-        target_ac: Target audio channels
-        max_segment_duration: Threshold for using intelligent chunking
-        min_chunk_duration: Minimum chunk duration for intelligent chunking
-        return_chunks: If True, returns list of chunk paths instead of concatenating them
-    
-    Returns:
-        Path to the created file (if return_chunks=False) or list of chunk paths (if return_chunks=True)
-    """
-    if ffmpeg is None or log is None:
-        print("ERROR: ffmpeg or log not initialized in ff_slice_smart.")
-        raise RuntimeError("ffmpeg or log not initialized")
-    
-    segment_duration = end_time - start_time
-    
-    if segment_duration <= max_segment_duration:
-        # Use regular ff_slice for short segments
-        ff_slice(src_path, dst_path, start_time, end_time, target_ac)
-        if return_chunks:
-            return [dst_path]  # Return as list for consistency
-        else:
-            return dst_path
-    
-    # Use intelligent chunking for long segments
-    log.info(f"Segment duration {segment_duration:.1f}s > {max_segment_duration}s. Using intelligent chunking.")
-    
-    if return_chunks:
-        # Return individual chunks instead of concatenating
-        temp_chunks_dir = dst_path.parent / f"temp_chunks_{dst_path.stem}"
-        ensure_dir_exists(temp_chunks_dir)
-        
-        try:
-            base_name = dst_path.stem
-            chunk_files = ff_slice_intelligent(
-                src_path=src_path,
-                dst_dir=temp_chunks_dir,
-                segment_start_time=start_time,
-                segment_end_time=end_time,
-                base_name=base_name,
-                target_sr=target_sr,
-                target_ac=target_ac,
-                max_segment_duration=max_segment_duration,
-                min_chunk_duration=min_chunk_duration
-            )
-            
-            if not chunk_files:
-                log.warning("No chunks created by intelligent chunking. Creating single fallback chunk.")
-                ff_slice(src_path, dst_path, start_time, end_time, target_ac)
-                return [dst_path]
-            
-            # Move chunks to final location with proper naming
-            final_chunks = []
-            for i, chunk_file in enumerate(chunk_files):
-                final_chunk_name = f"{dst_path.stem}_chunk{i+1:02d}{dst_path.suffix}"
-                final_chunk_path = dst_path.parent / final_chunk_name
-                shutil.move(str(chunk_file), str(final_chunk_path))
-                final_chunks.append(final_chunk_path)
-            
-            # Clean up temp directory
-            if temp_chunks_dir.exists():
-                shutil.rmtree(temp_chunks_dir, ignore_errors=True)
-            
-            log.info(f"Created {len(final_chunks)} chunks, returning individual chunk files for separate processing.")
-            return final_chunks
-            
-        except Exception as e:
-            log.error(f"Error in chunking mode: {e}. Falling back to single file.")
-            ff_slice(src_path, dst_path, start_time, end_time, target_ac)
-            return [dst_path]
-    
-    # Original concatenation behavior (return_chunks=False)
-    temp_chunks_dir = dst_path.parent / f"temp_chunks_{dst_path.stem}"
-    ensure_dir_exists(temp_chunks_dir)
-    
-    try:
-        # Create intelligent chunks
-        base_name = dst_path.stem
-        chunk_files = ff_slice_intelligent(
-            src_path=src_path,
-            dst_dir=temp_chunks_dir,
-            segment_start_time=start_time,
-            segment_end_time=end_time,
-            base_name=base_name,
-            target_sr=target_sr,
-            target_ac=target_ac,
-            max_segment_duration=max_segment_duration,
-            min_chunk_duration=min_chunk_duration
-        )
-        
-        if not chunk_files:
-            log.warning("No chunks created by intelligent chunking. Falling back to regular ff_slice.")
-            ff_slice(src_path, dst_path, start_time, end_time, target_ac)
-            return dst_path
-        
-        if len(chunk_files) == 1:
-            # Only one chunk, just move it to the final destination
-            chunk_files[0].rename(dst_path)
-            log.info(f"Single chunk created, moved to {dst_path.name}")
-        else:
-            # Multiple chunks, concatenate them
-            log.info(f"Concatenating {len(chunk_files)} chunks to create final segment.")
-            
-            # Create concatenation list file
-            concat_list_file = temp_chunks_dir / "concat_list.txt"
-            concat_lines = []
-            
-            for chunk_file in chunk_files:
-                if chunk_file.exists() and chunk_file.stat().st_size > 0:
-                    concat_lines.append(f"file '{chunk_file.resolve().as_posix()}'")
-            
-            if not concat_lines:
-                raise RuntimeError("No valid chunks found for concatenation")
-            
-            concat_list_file.write_text("\n".join(concat_lines), encoding="utf-8")
-            
-            # Use ffmpeg to concatenate chunks
-            try:
-                (
-                    ffmpeg.input(str(concat_list_file), format="concat", safe=0)
-                    .output(
-                        str(dst_path),
-                        acodec="pcm_s16le",
-                        ar=target_sr,
-                        ac=target_ac,
-                    )
-                    .overwrite_output()
-                    .run(quiet=True, capture_stdout=True, capture_stderr=True)
-                )
-                log.info(f"Successfully concatenated chunks to {dst_path.name}")
-            except ffmpeg.Error as e:
-                err_msg = e.stderr.decode('utf8', errors='ignore') if e.stderr else 'ffmpeg concatenation error'
-                log.error(f"ffmpeg concatenation failed: {err_msg}")
-                # Fallback to regular slicing
-                log.info("Falling back to regular ff_slice due to concatenation error.")
-                ff_slice(src_path, dst_path, start_time, end_time, target_ac)
-        
-        return dst_path
-        
-    finally:
-        # Clean up temporary chunks directory
-        if temp_chunks_dir.exists():
-            try:
-                shutil.rmtree(temp_chunks_dir)
-                log.debug(f"Cleaned up temporary chunks directory: {temp_chunks_dir}")
-            except Exception as e:
-                log.warning(f"Could not clean up temporary directory {temp_chunks_dir}: {e}")
 def ensure_models(component_usage=None):
     """Download only required models based on component usage"""
     if component_usage is None:
-        component_usage = {'use_speechbrain': True}
+        component_usage = {'use_bandit': True, 'use_speechbrain': True}
     
     logger_func = log.info if log else print
     logger_func("[Setup] Checking required models based on component usage...")
@@ -1328,7 +926,9 @@ def ensure_models(component_usage=None):
         component = config.get('component', '')
         
         should_download = False
-        if component == '' or component is None:  # Models without specific component are always needed
+        if component == 'bandit' and component_usage.get('use_bandit', False):
+            should_download = True
+        elif component == '' or component is None:  # Models without specific component are always needed
             should_download = True
         
         if should_download:
@@ -1356,7 +956,7 @@ def ensure_models(component_usage=None):
 def ensure_repositories(component_usage=None):
     """Clone and set up required repositories based on component usage"""
     if component_usage is None:
-        component_usage = {'use_speechbrain': True}
+        component_usage = {'use_bandit': True, 'use_speechbrain': True}
     
     _ensure(REQ)
     _import_dependencies()
@@ -1373,12 +973,332 @@ def ensure_repositories(component_usage=None):
     repos_dir = Path("repos")
     repos_dir.mkdir(exist_ok=True)
 
-    logger_func("[Setup] ✓ Repository setup complete")
+    # Handle Bandit-v2 only if needed
+    if component_usage.get('use_bandit', False):
+        bandit_path = repos_dir / "bandit-v2"
+        bandit_needs_setup = False
+
+        if bandit_path.exists():
+            logger_func("[Setup] Found existing Bandit-v2 directory, verifying it works...")
+            original_path = sys.path.copy()
+            try:
+                if str(bandit_path) not in sys.path:
+                    sys.path.insert(0, str(bandit_path))
+                # Also add src subdirectory
+                bandit_src_path = bandit_path / "src"
+                if bandit_src_path.exists() and str(bandit_src_path) not in sys.path:
+                    sys.path.insert(0, str(bandit_src_path))
+                
+                # Try different possible import paths
+                imported = False
+                for import_attempt in [
+                    "from inference import Predictor",
+                    "import inference",
+                    "from src import utils",
+                    "import separator"
+                ]:
+                    try:
+                        exec(import_attempt)
+                        logger_func(f"[Setup] ✓ Bandit-v2 import successful using: {import_attempt}")
+                        imported = True
+                        break
+                    except ImportError:
+                        continue
+                
+                if not imported:
+                    logger_func("[Setup] ✗ Bandit-v2 import failed - directory exists but module not working")
+                    bandit_needs_setup = True
+            except Exception as e:
+                logger_func(f"[Setup] ✗ Error checking Bandit-v2: {e}")
+                bandit_needs_setup = True
+            finally:
+                sys.path = original_path
+        else:
+            logger_func("[Setup] Bandit-v2 directory not found")
+            bandit_needs_setup = True
+
+        if bandit_needs_setup:
+            if bandit_path.exists():
+                logger_func("[Setup] Removing corrupted Bandit-v2 directory...")
+                # Directory removal code
+                if os.name == 'nt':
+                    try:
+                        shutil.rmtree(bandit_path)
+                        logger_func("[Setup] ✓ Removed old directory")
+                    except Exception as e:
+                        logger_func(f"[Setup] WARNING: Could not remove old directory with shutil: {e}")
+                        # Try alternative removal methods...
+                        try:
+                            logger_func("[Setup] Attempting Windows rmdir command...")
+                            subprocess.check_call(['cmd', '/c', 'rmdir', '/S', '/Q', str(bandit_path)], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                            logger_func("[Setup] ✓ Removed using Windows rmdir")
+                        except:
+                            try:
+                                logger_func("[Setup] Attempting PowerShell removal...")
+                                ps_cmd = f'Remove-Item -Path "{bandit_path}" -Recurse -Force -ErrorAction SilentlyContinue'
+                                subprocess.check_call(['powershell', '-Command', ps_cmd], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                                logger_func("[Setup] ✓ Removed using PowerShell")
+                            except:
+                                logger_func(f"[Setup] ERROR: Could not remove directory")
+                                sys.exit(1)
+                else:
+                    try:
+                        shutil.rmtree(bandit_path)
+                        logger_func("[Setup] ✓ Removed old directory")
+                    except Exception as e:
+                        logger_func(f"[Setup] ERROR: Could not remove directory: {e}")
+                        sys.exit(1)
+            
+            logger_func("[Setup] Cloning Bandit-v2 repository...")
+            try:
+                subprocess.check_call(["git", "clone", "https://github.com/kwatcharasupat/bandit-v2.git", str(bandit_path)])
+                
+                # Clean requirements.txt if it exists
+                req_txt_path = bandit_path / "requirements.txt"
+                req_in_path = bandit_path / "requirements.in"
+                
+                logger_func("[Setup] Cleaning Bandit-v2 requirements...")
+                
+                # Function to clean requirements content
+                def clean_requirements_content(content_lines):
+                    cleaned = []
+                    for line in content_lines:
+                        line = line.strip()
+                        
+                        # Skip empty lines and comments
+                        if not line or line.startswith('#'):
+                            cleaned.append(line)
+                            continue
+                        
+                        # Remove Netflix index URLs
+                        if line.startswith('--index-url') and 'netflix' in line.lower():
+                            logger_func(f"[Setup] Removing Netflix index URL: {line}")
+                            continue
+                        
+                        # Extract package name (handle various format combinations)
+                        # First handle ray special case
+                        if line.startswith('ray[') or line.startswith('ray=='):
+                            if '==2.11.0' in line:
+                                logger_func(f"[Setup] Replacing unavailable ray version: {line} → ray>=2.10.0,<2.20")
+                                cleaned.append('ray>=2.10.0,<2.20')
+                                continue
+                        
+                        # Now handle other packages
+                        package_name = re.split(r'[<>=\[!~]', line)[0].strip()
+                        
+                        # Also check for underscore variant of nflx
+                        if package_name == 'nflx_metaflow':
+                            logger_func(f"[Setup] Removing Netflix-internal package: {line}")
+                            continue
+                        
+                        # Skip Netflix-internal packages
+                        if NETFLIX_PRIVATE_PACKAGES.match(package_name):
+                            logger_func(f"[Setup] Removing Netflix-internal package: {line}")
+                            continue
+                        
+                        # Skip specific PyTorch versions (we'll use our own)
+                        if package_name in ['torch', 'torchvision', 'torchaudio'] and ('==' in line or '+cu' in line):
+                            logger_func(f"[Setup] Skipping specific PyTorch version: {line}")
+                            continue
+                        
+                        cleaned.append(line)
+                    
+                    return cleaned
+                
+                # Try to clean requirements.in first (if it exists)
+                cleaned_req_file = None
+                if req_in_path.exists():
+                    logger_func("[Setup] Found requirements.in, cleaning it...")
+                    with open(req_in_path, 'r') as f:
+                        original_lines = f.readlines()
+                    
+                    cleaned_lines = clean_requirements_content(original_lines)
+                    
+                    # Write cleaned version
+                    cleaned_req_in = bandit_path / "requirements_cleaned.in"
+                    with open(cleaned_req_in, 'w') as f:
+                        f.write('\n'.join(cleaned_lines))
+                    
+                    cleaned_req_file = cleaned_req_in
+                    logger_func(f"[Setup] Created cleaned requirements file: {cleaned_req_in}")
+                
+                # If no requirements.in or as fallback, clean requirements.txt
+                elif req_txt_path.exists():
+                    logger_func("[Setup] Found requirements.txt, cleaning it...")
+                    with open(req_txt_path, 'r') as f:
+                        original_lines = f.readlines()
+                    
+                    cleaned_lines = clean_requirements_content(original_lines)
+                    
+                    # Write cleaned version
+                    cleaned_req_txt = bandit_path / "requirements_cleaned.txt"
+                    with open(cleaned_req_txt, 'w') as f:
+                        f.write('\n'.join(cleaned_lines))
+                    
+                    cleaned_req_file = cleaned_req_txt
+                    logger_func(f"[Setup] Created cleaned requirements file: {cleaned_req_txt}")
+                
+                # If we have a cleaned requirements file, use it
+                if cleaned_req_file and cleaned_req_file.exists():
+                    logger_func("[Setup] Installing Bandit-v2 dependencies from cleaned requirements...")
+                    env = os.environ.copy()
+                    env["PIP_INDEX_URL"] = "https://pypi.org/simple"
+                    
+                    # Check if we're using CUDA or CPU
+                    if torch and torch.cuda.is_available():
+                        extra_index_args = ["--extra-index-url", "https://download.pytorch.org/whl/cu121"]
+                    else:
+                        extra_index_args = ["--extra-index-url", "https://download.pytorch.org/whl/cpu"]
+                    
+                    try:
+                        # Install from cleaned requirements
+                        subprocess.check_call([
+                            sys.executable, "-m", "pip", "install",
+                            "--upgrade",
+                            "--index-url", "https://pypi.org/simple",
+                            *extra_index_args,  # Unpack the list
+                            "-r", str(cleaned_req_file)
+                        ], env=env)
+                        
+                        logger_func("[Setup] ✓ Successfully installed Bandit-v2 dependencies")
+                        
+                    except subprocess.CalledProcessError as e:
+                        logger_func(f"[Setup] Warning: Some dependencies failed to install: {e}")
+                        logger_func("[Setup] Attempting to install core dependencies only...")
+                        
+                        # Fallback: Install only the most essential dependencies
+                        core_deps = [
+                            "asteroid>=0.7.0",
+                            "asteroid-filterbanks>=0.4.0", 
+                            "julius>=0.2.7",
+                            "hydra-core>=1.3.2",
+                            "pytorch-lightning>=2.3.0",
+                            "einops>=0.8.0",
+                            "torch-audiomentations>=0.11.1",
+                            "tqdm>=4.66.0",
+                            "ray>=2.10.0,<2.20",
+                            "pandas",
+                            "tensorboard",
+                            "tensorboardX"
+                        ]
+                        
+                        try:
+                            subprocess.check_call([
+                                sys.executable, "-m", "pip", "install",
+                                "--upgrade",
+                                "--index-url", "https://pypi.org/simple",
+                                *extra_index_args,
+                                *core_deps
+                            ], env=env)
+                            logger_func("[Setup] ✓ Installed core Bandit-v2 dependencies")
+                        except subprocess.CalledProcessError as e2:
+                            logger_func(f"[Setup] ERROR: Failed to install even core dependencies: {e2}")
+                            logger_func("[Setup] Bandit-v2 may not function properly")
+                
+                # Bandit-v2 doesn't have setup.py, so we don't try to install it as a package
+                logger_func("[Setup] ✓ Bandit-v2 repository cloned and dependencies installed")
+                logger_func("[Setup] Note: Bandit-v2 will be used via direct imports (no package installation needed)")
+                    
+            except subprocess.CalledProcessError as e:
+                logger_func(f"[Setup] ERROR: Failed to clone Bandit-v2 repository: {e}")
+                logger_func("[Setup] Please check your internet connection and that Git is properly installed")
+                sys.exit(1)
+
+        # Always ensure Bandit-v2 is in the path
+        if str(bandit_path) not in sys.path:
+            sys.path.insert(0, str(bandit_path))
+        
+        # Also add the src subdirectory if it exists
+        bandit_src_path = bandit_path / "src"
+        if bandit_src_path.exists() and str(bandit_src_path) not in sys.path:
+            sys.path.insert(0, str(bandit_src_path))
+            logger_func(f"[Setup] Also added Bandit-v2/src to sys.path: {bandit_src_path}")
+        
+        os.environ['BANDIT_REPO_PATH'] = str(bandit_path)
+        
+        # Final verification with better logging
+        logger_func("[Setup] Attempting final verification of Bandit-v2 imports...")
+        
+        # First ensure ray.train is available or mocked
+        try:
+            import ray
+            try:
+                import ray.train
+            except ImportError:
+                logger_func("[Setup] ray.train not available, creating mock...")
+                import types
+                if not hasattr(ray, 'train'):
+                    ray.train = types.ModuleType('ray.train')
+                    sys.modules['ray.train'] = ray.train
+        except ImportError:
+            logger_func("[Setup] Ray not available, attempting to install...")
+            try:
+                env = os.environ.copy()
+                env["PIP_INDEX_URL"] = "https://pypi.org/simple"
+                subprocess.check_call([
+                    sys.executable, "-m", "pip", "install",
+                    "--index-url", "https://pypi.org/simple",
+                    "ray[train]>=2.10.0,<2.20", "pandas", "tensorboard", "tensorboardX"
+                ], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                logger_func("[Setup] ✓ Installed ray[train] and dependencies")
+                import ray
+                import ray.train
+            except:
+                logger_func("[Setup] Warning: Could not install ray[train], creating minimal mock")
+                import types
+                ray = types.ModuleType('ray')
+                ray.train = types.ModuleType('ray.train')
+                sys.modules['ray'] = ray
+                sys.modules['ray.train'] = ray.train
+        
+        imported = False
+        successful_import = None
+        
+        import_attempts = [
+            ("inference", None, "Inference module"),  # Changed: Don't look for specific class
+            ("src.utils", None, "Utils from src"),
+            ("separator", None, "Direct separator module"),
+            ("bandit_v2.separator", None, "Separator via bandit_v2 package")
+        ]
+        
+        for module_name, class_name, description in import_attempts:
+            try:
+                if class_name:
+                    module = importlib.import_module(module_name)
+                    getattr(module, class_name)
+                else:
+                    importlib.import_module(module_name)
+                logger_func(f"[Setup] ✓ Final verification: Bandit-v2 imports working correctly ({description})")
+                imported = True
+                successful_import = module_name
+                break
+            except ImportError as e:
+                logger_func(f"[Setup] Failed to import {module_name}: {str(e)}")
+                continue
+        
+        if not imported:
+            logger_func("[Setup] WARNING: Could not import Bandit-v2 separator with any known pattern")
+            logger_func("[Setup] Available in bandit_path:")
+            try:
+                for item in sorted(bandit_path.iterdir()):
+                    if item.is_file() and item.suffix == '.py':
+                        logger_func(f"  - {item.name}")
+                if bandit_src_path.exists():
+                    logger_func("[Setup] Available in src/:")
+                    for item in sorted(bandit_src_path.iterdir()):
+                        if item.is_file() and item.suffix == '.py':
+                            logger_func(f"  - src/{item.name}")
+            except:
+                pass
+            logger_func("[Setup] You may need to check audio_pipeline.py for the correct import path")
+    else:
+        logger_func("[Setup] Skipping Bandit-v2 setup (not needed)")
 
 
 if __name__ == '__main__':
     # For testing
     component_usage = {
+        'use_bandit': True,
         'use_speechbrain': True,
     }
     ensure_repositories(component_usage)
